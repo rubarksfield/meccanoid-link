@@ -27,12 +27,16 @@ The first app connection attempt timed out before notification subscription. Nei
 | Blue eyes | Blue button used in the app; operator explicitly confirmed blue eyes |
 | Eye gate | Operator confirmed the visible change in the app |
 | Position read | App received joint-position data |
-| Joint nudge | With operator readiness confirmed, one +3 raw-unit nudge requested for slot 3; app logged accepted mode and pose writes; physical effect awaiting operator report |
+| Joint nudge | With operator readiness confirmed, isolated +3 raw-unit nudges requested for slot 3; app logged accepted mode and pose writes; feedback remained 33. On the observed retry the operator reported no movement, but a right-elbow light flash |
 | Stop | Stop requested after the nudge; zero-wheel and stop-preset writes accepted; app visibly disabled movement |
 | Wheels | No nonzero wheel command requested |
 | iPhone/iPad hardware | Not tested; builds do not establish physical Bluetooth operation |
 
 Stop submission and disabled controls do not establish that every actuator physically stopped. No mechanical mapping, calibration, wheel-direction or lost-link stopping claim is made from this pilot.
+
+The flash is an observation, not confirmation that slot 3 drives the right elbow. The nudge path also changes servo mode and sends a complete pose, so the flashing module cannot yet establish the selected slot's mechanical identity. No increase in range was made in response to the failed movement test.
+
+The next software revision refreshes the same small target for a bounded one-second window, based on the original app's repeated-write behaviour. This timing change still needs a supervised physical test; it is not recorded as a movement fix.
 
 ## Prepare
 

@@ -18,8 +18,12 @@ final class DemoRobotTransport: RobotTransport {
         guard id == self.id else { return }
         connected = true; onEvent?(.connected); onEvent?(.subscribed)
     }
-    func send(_ data: Data, completion: @escaping (Result<Void, Error>) -> Void) {
+    func send(_ data: Data, notAfter: ContinuousClock.Instant?, completion: @escaping (Result<Void, Error>) -> Void) {
         guard connected else { completion(.failure(LinkError(message: "Practice robot disconnected"))); return }
+        if let notAfter, ContinuousClock().now >= notAfter {
+            completion(.failure(LinkError(message: "Command expired before practice transport could send it.")))
+            return
+        }
         completion(.success(()))
         switch data.first {
         case 0x1a: onEvent?(.received(MeccanoidPacket.pin()))

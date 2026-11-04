@@ -9,6 +9,9 @@ import MeccanoidCore
 private final class FakeTransport: RobotTransport {
     var onEvent: ((TransportEvent) -> Void)?
     var writes: [Data] = []
+    var transmitted: [(data: Data, at: ContinuousClock.Instant, notAfter: ContinuousClock.Instant?)] = []
+    var queued: [(data: Data, notAfter: ContinuousClock.Instant?, completion: (Result<Void, Error>) -> Void)] = []
+    var queuesWrites = false
     var heldCompletions: [(Result<Void, Error>) -> Void] = []
     var completesImmediately = true
     var failHeldWritesOnCancellation = false
@@ -21,13 +24,35 @@ private final class FakeTransport: RobotTransport {
     func startScan() { scanCount += 1 }
     func stopScan() { stopScanCount += 1 }
     func connect(to id: UUID) { connectIDs.append(id) }
-    func send(_ data: Data, completion: @escaping (Result<Void, Error>) -> Void) {
+    func send(_ data: Data, notAfter: ContinuousClock.Instant?, completion: @escaping (Result<Void, Error>) -> Void) {
         writes.append(data)
+        if queuesWrites {
+            queued.append((data, notAfter, completion))
+            return
+        }
+        transmit(data, notAfter: notAfter, completion: completion)
+    }
+    private func transmit(_ data: Data, notAfter: ContinuousClock.Instant?, completion: @escaping (Result<Void, Error>) -> Void) {
+        let instant = ContinuousClock.now
+        if let notAfter, instant >= notAfter {
+            completion(.failure(LinkError(message: "Command expired before transmission")))
+            return
+        }
+        transmitted.append((data, instant, notAfter))
         if completesImmediately { completion(.success(())) }
         else { heldCompletions.append(completion) }
     }
+    func drainQueuedWrites() {
+        while !queued.isEmpty {
+            let next = queued.removeFirst()
+            transmit(next.data, notAfter: next.notAfter, completion: next.completion)
+        }
+    }
     func cancelPendingWrites() {
         cancellationCount += 1
+        let cancelledQueue = queued
+        queued.removeAll()
+        cancelledQueue.forEach { $0.completion(.failure(LinkError(message: "Command cancelled"))) }
         if failHeldWritesOnCancellation {
             let cancelled = heldCompletions
             heldCompletions.removeAll()
@@ -79,8 +104,14 @@ final class RobotControllerTests: XCTestCase {
 
         controller.jog(slot: 2, delta: 3)
         XCTAssertTrue(controller.motionBusy)
+        // A manual read cannot interfere with the bounded refresh or its final
+        // readback. Wait for the public operation to finish using the real demo.
         controller.refreshPose()
+        XCTAssertEqual(controller.positions, Array(repeating: 128, count: 8))
+        let finished = await waitUntil { !controller.motionBusy }
+        XCTAssertTrue(finished)
         XCTAssertEqual(controller.positions, [128, 128, 131, 128, 128, 128, 128, 128])
+        XCTAssertFalse(controller.motionBusy)
 
         controller.stop()
         XCTAssertEqual(controller.phase, .ready)
@@ -111,6 +142,20 @@ final class RobotControllerTests: XCTestCase {
         let sum = bytes.reduce(0) { $0 + Int($1) }
         bytes += [UInt8(sum >> 8), UInt8(sum & 255)]
         return Data(bytes)
+    }
+
+    private func waitUntil(timeout: Duration = .seconds(3), _ condition: () -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while !condition(), ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return condition()
+    }
+
+    /// Deliberately prevents the actor's expiry Task from running. A queued
+    /// transport must still enforce each packet's deadline when it becomes ready.
+    private func stallActorForDeadlineTest() {
+        Thread.sleep(forTimeInterval: 1.05)
     }
 
     private func connecting(_ transport: FakeTransport, clock: TestClock? = nil) -> RobotController {
@@ -334,6 +379,190 @@ final class RobotControllerTests: XCTestCase {
         XCTAssertFalse(controller.motionBusy)
     }
 
+    func testJogRefreshRepeatsOneFrozenTargetAndWaitsForFinalReadback() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        transport.writes.removeAll(); transport.transmitted.removeAll()
+        controller.jog(slot: 2, delta: 3)
+        let baseline: [UInt8] = [90, 100, 110, 120, 130, 140, 150, 160]
+        transport.emit(.received(poseReply(baseline)))
+        let countBeforeManualRead = transport.writes.count
+        controller.refreshPose()
+        XCTAssertEqual(transport.writes.count, countBeforeManualRead)
+        let finalReadRequested = await waitUntil {
+            transport.writes.filter { $0.first == 9 }.count == 2
+        }
+        XCTAssertTrue(finalReadRequested)
+        let frames = transport.transmitted.filter { $0.data.first == 8 }
+        XCTAssertGreaterThan(frames.count, 1)
+        XCTAssertLessThanOrEqual(frames.count, 10)
+        let expected = try MeccanoidPacket.pose([90, 100, 113, 120, 130, 140, 150, 160])
+        XCTAssertTrue(frames.allSatisfy { $0.data == expected }, "The delta must never accumulate across repeated packets")
+        let expiry = try XCTUnwrap(frames.first?.notAfter)
+        XCTAssertTrue(frames.allSatisfy { $0.notAfter == expiry && $0.at < expiry })
+        XCTAssertTrue(controller.motionBusy, "Remain busy until final position feedback arrives")
+        transport.emit(.received(poseReply([90, 100, 112, 120, 130, 140, 150, 160])))
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertEqual(controller.positions?[2], 112, "Show measured feedback, not the requested target")
+        XCTAssertTrue(controller.logs.contains { $0.contains("110 → 113") })
+    }
+
+    func testJogRefreshBackpressureAndLateCompletionCannotExtendDeadline() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.completesImmediately = false
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(transport.writes.filter { $0.first == 8 }.count, 1, "Never queue behind an outstanding pose")
+        let firstAcceptedAt = ContinuousClock.now
+        transport.completeNext()
+        let secondFrame = await waitUntil(timeout: .milliseconds(300)) {
+            transport.writes.filter { $0.first == 8 }.count == 2
+        }
+        XCTAssertTrue(secondFrame)
+        let secondHandoff = try XCTUnwrap(transport.transmitted.filter { $0.data.first == 8 }.dropFirst().first)
+        XCTAssertGreaterThanOrEqual(firstAcceptedAt.duration(to: secondHandoff.at), .milliseconds(100), "Wait after acceptance rather than catching up")
+        let expired = await waitUntil(timeout: .seconds(2)) { controller.phase == .failed }
+        XCTAssertTrue(expired)
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertFalse(controller.motionEnabled)
+        XCTAssertEqual(transport.disconnectCount, 1)
+        let count = transport.writes.count
+        transport.completeNext() // Completion of a frame already handed off.
+        try await Task.sleep(for: .milliseconds(150))
+        XCTAssertEqual(transport.writes.count, count, "A late completion must not schedule a frame or read")
+    }
+
+    func testQueuedPoseCannotTransmitAfterDeadlineEvenBeforeExpiryTaskRuns() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.queuesWrites = true
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        XCTAssertEqual(transport.queued.count, 1)
+        stallActorForDeadlineTest()
+        transport.drainQueuedWrites() // Readiness occurs before the controller's Task can execute.
+        XCTAssertFalse(transport.transmitted.contains { $0.data.first == 8 })
+        XCTAssertTrue(transport.queued.isEmpty)
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertEqual(transport.disconnectCount, 1)
+    }
+
+    func testIndependentDeadlineCancelsPoseThatNeverBecomesReady() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.queuesWrites = true
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        XCTAssertEqual(transport.queued.count, 1)
+        let failed = await waitUntil(timeout: .seconds(2)) { controller.phase == .failed }
+        XCTAssertTrue(failed)
+        XCTAssertTrue(transport.queued.isEmpty, "The independent deadline must cancel an unsent pose without a readiness callback")
+        XCTAssertEqual(transport.disconnectCount, 1, "Synchronous cancellation failures must not recursively fail")
+        XCTAssertFalse(controller.motionBusy)
+        transport.drainQueuedWrites()
+        XCTAssertFalse(transport.transmitted.contains { $0.data.first == 8 })
+    }
+
+    func testStopDuringRefreshCancelsEveryLaterPoseAndSettlingRead() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        try await Task.sleep(for: .milliseconds(230))
+        controller.stop()
+        let poses = transport.writes.filter { $0.first == 8 }.count
+        let reads = transport.writes.filter { $0.first == 9 }.count
+        try await Task.sleep(for: .milliseconds(1200))
+        XCTAssertEqual(transport.writes.filter { $0.first == 8 }.count, poses)
+        XCTAssertEqual(transport.writes.filter { $0.first == 9 }.count, reads)
+        XCTAssertEqual(controller.phase, .ready)
+        XCTAssertFalse(controller.motionBusy)
+    }
+
+    func testStopPreservesOutstandingPoseReadUntilOldReplyIsDrained() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1) // Its fresh 09 request remains unanswered.
+        controller.stop()
+        controller.setMotionEnabled(true)
+        let before = transport.writes.count
+        controller.jog(slot: 0, delta: 1)
+        XCTAssertEqual(transport.writes.count, before)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 }, "Old readback cannot execute the cancelled jog")
+        controller.jog(slot: 0, delta: 1)
+        XCTAssertEqual(transport.writes.last, MeccanoidPacket.readPose())
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 }, "A second jog must await its own fresh response")
+    }
+
+    func testStopKeepsDeadlineForAnOutstandingPoseRead() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        controller.stop()
+        controller.setMotionEnabled(true)
+        let failed = await waitUntil { controller.phase == .failed }
+        XCTAssertTrue(failed)
+        XCTAssertTrue(controller.errorMessage?.contains("joint-position") == true)
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertFalse(controller.motionEnabled)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+    }
+
+    func testReconnectCannotReviveOldJogWriteCompletion() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.completesImmediately = false
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        transport.emit(.disconnected(nil))
+        transport.completesImmediately = true
+        controller.startScan()
+        let nextRobot = DiscoveredRobot(id: UUID(), name: "MECCANOID RETRY", rssi: -42)
+        transport.emit(.discovered(nextRobot))
+        controller.connect(to: nextRobot.id)
+        transport.emit(.connected); transport.emit(.subscribed)
+        transport.emit(.received(acceptedPin))
+        enable(controller, transport: transport)
+        let count = transport.writes.count
+        transport.completeNext()
+        try await Task.sleep(for: .milliseconds(180))
+        XCTAssertEqual(transport.writes.count, count)
+        XCTAssertEqual(controller.phase, .ready)
+        XCTAssertFalse(controller.motionBusy)
+    }
+
+    func testMissingFinalJogReadbackFailsAndClearsBusy() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        let failed = await waitUntil(timeout: .seconds(4)) { controller.phase == .failed }
+        XCTAssertTrue(failed)
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertFalse(controller.motionEnabled)
+        XCTAssertTrue(controller.errorMessage?.contains("joint-position") == true)
+        XCTAssertEqual(transport.disconnectCount, 1)
+    }
+
     func testAbsentOrOutOfRangeJogSlotNeverProducesPoseWrite() async {
         let transport = FakeTransport()
         let controller = ready(transport)
@@ -554,13 +783,19 @@ final class RobotControllerTests: XCTestCase {
         XCTAssertEqual(controller.errorMessage, "Test write failure")
     }
 
-    func testInactiveAppStopsEnabledMotion() async {
+    func testInactiveAppStopsEnabledMotion() async throws {
         let transport = FakeTransport()
         let controller = ready(transport)
         defer { transport.emit(.disconnected(nil)) }
         enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
         controller.appBecameInactive()
         XCTAssertFalse(controller.motionEnabled)
         XCTAssertTrue(transport.writes.suffix(2).contains(MeccanoidPacket.zeroWheels()))
+        let poses = transport.writes.filter { $0.first == 8 }.count
+        try await Task.sleep(for: .milliseconds(1150))
+        XCTAssertEqual(transport.writes.filter { $0.first == 8 }.count, poses)
+        XCTAssertFalse(controller.motionBusy)
     }
 }

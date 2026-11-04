@@ -12,7 +12,7 @@ final class CoreBluetoothTransport: NSObject, RobotTransport, @preconcurrency CB
     private var reader: CBCharacteristic?
     private var wantsScan = false
     private var subscribed = false
-    private var pending: [(Data, (Result<Void, Error>) -> Void)] = []
+    private var pending: [(data: Data, notAfter: ContinuousClock.Instant?, completion: (Result<Void, Error>) -> Void)] = []
     private var inFlight: ((Result<Void, Error>) -> Void)?
     private var writeDeadline: Task<Void, Never>?
     private var isDraining = false
@@ -47,32 +47,49 @@ final class CoreBluetoothTransport: NSObject, RobotTransport, @preconcurrency CB
         central?.connect(peripheral, options: nil)
     }
 
-    func send(_ data: Data, completion: @escaping (Result<Void, Error>) -> Void) {
+    func send(_ data: Data, notAfter: ContinuousClock.Instant?, completion: @escaping (Result<Void, Error>) -> Void) {
         guard robot?.state == .connected, writer != nil else {
             completion(.failure(LinkError(message: "Robot is disconnected."))); return
         }
         guard data.count == 20 else {
             completion(.failure(LinkError(message: "Invalid command length."))); return
         }
-        pending.append((data, completion))
+        if let notAfter, ContinuousClock().now >= notAfter {
+            completion(.failure(LinkError(message: "Command expired before Bluetooth could send it."))); return
+        }
+        pending.append((data, notAfter, completion))
         armWriteDeadline()
         drain()
     }
 
     private func drain() {
-        guard !isDraining, let robot, robot.state == .connected, let writer, inFlight == nil else { return }
+        guard !isDraining, let robot, robot.state == .connected, let writer else { return }
         isDraining = true
         defer { isDraining = false }
         while !pending.isEmpty {
+            // Discard an expired head even while flow control is blocked. The
+            // completion may synchronously cancel the remainder of this queue.
+            if let deadline = pending[0].notAfter, ContinuousClock().now >= deadline {
+                let expired = pending.removeFirst()
+                expired.completion(.failure(LinkError(message: "Command expired before Bluetooth could send it.")))
+                continue
+            }
+            guard inFlight == nil else { return }
             if writeType == .withoutResponse && !robot.canSendWriteWithoutResponse { return }
-            let (data, completion) = pending.removeFirst()
+            let (data, notAfter, completion) = pending.removeFirst()
+            // Recheck at the handoff itself: a readiness callback can run after
+            // the controller's deadline even if its expiry task has not run yet.
+            if let notAfter, ContinuousClock().now >= notAfter {
+                completion(.failure(LinkError(message: "Command expired before Bluetooth could send it.")))
+                continue
+            }
             if writeType == .withResponse { inFlight = completion }
             robot.writeValue(data, for: writer, type: writeType)
             if writeType == .withResponse { return }
             // CoreBluetooth accepted the write. This is NOT a robot acknowledgement.
             completion(.success(()))
         }
-        writeDeadline?.cancel(); writeDeadline = nil
+        if inFlight == nil { writeDeadline?.cancel(); writeDeadline = nil }
     }
 
     private func armWriteDeadline() {
@@ -90,7 +107,7 @@ final class CoreBluetoothTransport: NSObject, RobotTransport, @preconcurrency CB
     func cancelPendingWrites() {
         let cancelled = pending; pending.removeAll()
         if inFlight == nil { writeDeadline?.cancel(); writeDeadline = nil }
-        for item in cancelled { item.1(.failure(LinkError(message: "Command cancelled."))) }
+        for item in cancelled { item.completion(.failure(LinkError(message: "Command cancelled."))) }
         // A write already handed to CoreBluetooth cannot be recalled. Preserve its
         // response slot so a late acknowledgement cannot complete a newer write.
     }

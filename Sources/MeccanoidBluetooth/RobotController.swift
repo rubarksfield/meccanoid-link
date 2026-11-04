@@ -26,6 +26,9 @@ public final class RobotController {
     @ObservationIgnored private var actionTask: Task<Void, Never>?
     @ObservationIgnored private var disconnectTask: Task<Void, Never>?
     @ObservationIgnored private var poseReadTask: Task<Void, Never>?
+    @ObservationIgnored private var jogDeadlineTask: Task<Void, Never>?
+    @ObservationIgnored private var jogRefresh: JogRefresh?
+    @ObservationIgnored private var jogReadbackPending = false
     @ObservationIgnored private var poseRequestPending = false
     @ObservationIgnored private var jogSampleRequested = false
     @ObservationIgnored private var lastReplyAt: Date?
@@ -33,6 +36,17 @@ public final class RobotController {
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var isDisconnecting = false
     @ObservationIgnored private var heartbeatPending = false
+
+    private struct JogRefresh {
+        let id = UUID()
+        let packet: Data
+        let deadline: ContinuousClock.Instant
+        let slot: Int
+        let before: Int
+        let target: Int
+        var frames = 0
+        var awaitingWrite = false
+    }
 
     public convenience init(demo: Bool = false) {
         self.init(transport: demo ? DemoRobotTransport() : CoreBluetoothTransport())
@@ -148,7 +162,7 @@ public final class RobotController {
     }
 
     public func refreshPose() {
-        guard isConnected, !isDisconnecting, !poseRequestPending, pendingJog == nil else { return }
+        guard isConnected, !isDisconnecting, !motionBusy, !poseRequestPending, pendingJog == nil else { return }
         requestPose()
     }
 
@@ -195,17 +209,73 @@ public final class RobotController {
         }
         var pose = positions; pose[jog.slot] = UInt8(target)
         do {
-            send(try MeccanoidPacket.pose(pose)) { [weak self] in
-                guard let self else { return }
-                self.log("Joint \(jog.slot + 1) nudge sent (\(jog.delta > 0 ? "+" : "")\(jog.delta) raw units)")
-                self.statusMessage = "Small joint nudge sent. Observe its direction and clearance."
-                self.actionTask = Task { [weak self] in
-                    try? await Task.sleep(for: .milliseconds(500))
-                    guard !Task.isCancelled, let self else { return }
-                    self.motionBusy = false; self.refreshPose()
-                }
+            // Freeze the complete target once. Repetition never adds another delta.
+            let refresh = JogRefresh(
+                packet: try MeccanoidPacket.pose(pose),
+                deadline: ContinuousClock.now.advanced(by: .seconds(1)),
+                slot: jog.slot, before: before, target: target
+            )
+            jogRefresh = refresh
+            jogDeadlineTask = Task { [weak self] in
+                try? await ContinuousClock().sleep(until: refresh.deadline)
+                guard !Task.isCancelled, let self else { return }
+                self.finishJogRefresh(id: refresh.id)
             }
+            sendJogFrame(id: refresh.id)
         } catch { motionBusy = false; report(error.localizedDescription) }
+    }
+
+    private func sendJogFrame(id: UUID) {
+        guard var refresh = jogRefresh, refresh.id == id,
+              isConnected, motionEnabled, !isDisconnecting, !refresh.awaitingWrite else { return }
+        guard ContinuousClock.now < refresh.deadline, refresh.frames < 10 else {
+            finishJogRefresh(id: id); return
+        }
+        refresh.frames += 1
+        refresh.awaitingWrite = true
+        jogRefresh = refresh
+        send(refresh.packet, quiet: true, notAfter: refresh.deadline) { [weak self] in
+            guard let self, var current = self.jogRefresh, current.id == id else { return }
+            current.awaitingWrite = false
+            self.jogRefresh = current
+            if current.frames == 1 {
+                self.log("Joint \(current.slot + 1) target \(current.before) → \(current.target) accepted for bounded refresh")
+                self.statusMessage = "Refreshing the same small joint target. Observe its direction and clearance."
+            }
+            guard ContinuousClock.now < current.deadline, current.frames < 10 else {
+                self.finishJogRefresh(id: id); return
+            }
+            // Backpressure: one accepted frame, then a delay. Never catch up by
+            // queuing a burst when a previous write was slow.
+            self.actionTask = Task { [weak self] in
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, let self else { return }
+                self.sendJogFrame(id: id)
+            }
+        }
+    }
+
+    private func finishJogRefresh(id: UUID) {
+        guard let refresh = jogRefresh, refresh.id == id else { return }
+        if refresh.awaitingWrite {
+            // resetSession invalidates callbacks before cancelling unsent writes.
+            // A command already handed to CoreBluetooth cannot be recalled.
+            fail("Joint command did not complete within its refresh window. Reconnect before trying again.")
+            return
+        }
+        jogRefresh = nil
+        jogDeadlineTask?.cancel(); jogDeadlineTask = nil
+        actionTask?.cancel()
+        log("Bounded joint refresh finished after \(refresh.frames) frames")
+        statusMessage = "Joint refresh finished. Waiting for position feedback…"
+        let epoch = generation
+        actionTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(500))
+            guard !Task.isCancelled, let self, self.generation == epoch,
+                  self.isConnected, self.motionEnabled, !self.isDisconnecting else { return }
+            self.jogReadbackPending = true
+            self.requestPose()
+        }
     }
 
     public func drive(left: Int, right: Int) {
@@ -239,6 +309,8 @@ public final class RobotController {
 
     public func stop() {
         generation += 1; actionTask?.cancel(); actionTask = nil
+        jogDeadlineTask?.cancel(); jogDeadlineTask = nil; jogRefresh = nil
+        jogReadbackPending = false
         heartbeatPending = false
         pendingJog = nil; motionBusy = false; motionEnabled = false
         jogSampleRequested = false
@@ -255,10 +327,11 @@ public final class RobotController {
         if phase == .scanning { stopScan() }
     }
 
-    private func send(_ data: Data, quiet: Bool = false, onSent: @escaping () -> Void = {}) {
+    private func send(_ data: Data, quiet: Bool = false, notAfter: ContinuousClock.Instant? = nil,
+                      onSent: @escaping () -> Void = {}) {
         guard isConnected || phase == .handshaking else { return }
         let epoch = generation
-        transport.send(data) { [weak self] result in
+        transport.send(data, notAfter: notAfter) { [weak self] result in
             guard let self, epoch == self.generation else { return }
             switch result {
             case .success:
@@ -304,7 +377,10 @@ public final class RobotController {
                     guard poseRequestPending else { return }
                     poseRequestPending = false; poseReadTask?.cancel(); poseReadTask = nil
                     positions = values
-                    if pendingJog != nil { completeJog(with: values) }
+                    if jogReadbackPending {
+                        jogReadbackPending = false; motionBusy = false
+                        statusMessage = "Joint feedback received. Check whether the intended part moved."
+                    } else if pendingJog != nil { completeJog(with: values) }
                 case .status(let value): robotStatus = value
                 default: break
                 }
@@ -351,10 +427,11 @@ public final class RobotController {
 
     private func resetSession() {
         generation += 1
-        deadlineTask?.cancel(); heartbeatTask?.cancel(); actionTask?.cancel(); disconnectTask?.cancel(); poseReadTask?.cancel()
+        deadlineTask?.cancel(); heartbeatTask?.cancel(); actionTask?.cancel(); disconnectTask?.cancel(); poseReadTask?.cancel(); jogDeadlineTask?.cancel()
         deadlineTask = nil; heartbeatTask = nil; actionTask = nil; disconnectTask = nil
         pendingJog = nil; motionBusy = false; motionEnabled = false; eyesConfirmed = false
         poseReadTask = nil; poseRequestPending = false; jogSampleRequested = false
+        jogDeadlineTask = nil; jogRefresh = nil; jogReadbackPending = false
         positions = nil; robotStatus = nil; lastEyeColor = nil; lastReplyAt = nil; heartbeatPending = false
         transport.cancelPendingWrites()
     }

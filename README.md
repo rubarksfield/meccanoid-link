@@ -2,7 +2,7 @@
 
 A native SwiftUI controller for Meccanoid robots on **iPhone, iPad and Mac**. It connects directly to the original MeccaBrain over Bluetooth Low Energy. No replacement controller, firmware flashing, browser, account or cloud service is required by this app.
 
-**Experimental alpha. Bluetooth connection and blue eyes are physically confirmed through the native Mac app on one model 91763 MeccaBrain.** The operator confirmed the blue-eye change on 4 November 2026. A single small joint-nudge command was submitted and movement then disabled; its physical effect has not yet been confirmed. Wheels and physical iPhone/iPad control remain untested. See the [hardware evidence](docs/hardware-pilot.md).
+**Experimental alpha. Bluetooth connection and blue eyes are physically confirmed through the native Mac app on one model 91763 MeccaBrain.** The operator confirmed the blue-eye change on 4 November 2026. Small joint nudges have not produced confirmed movement: the operator observed a right-elbow light flash, and the reported position stayed unchanged. Wheels and physical iPhone/iPad control remain untested. See the [hardware evidence](docs/hardware-pilot.md).
 
 Builds, automated checks and practice mode cannot establish joint travel, wheel direction or reliable stopping. Compatibility with each robot generation and firmware remains unverified.
 
@@ -56,7 +56,7 @@ The initial movement limits are intentionally small:
 
 | Control | App behaviour | What remains unknown |
 | --- | --- | --- |
-| Joint nudge | At most ±3 raw units, after a fresh complete eight-slot pose; preserves the other seven values | Physical joint identity, degrees, direction and mechanical limits |
+| Joint nudge | At most ±3 raw units after a fresh complete pose; refreshes the same target for up to one second, preserving the other seven values | Physical movement, joint identity, degrees, direction and mechanical limits |
 | Wheels | At most ±40 raw PWM units; schedules zero-speed after 250 ms | Actual speed, direction and physical pulse duration |
 | Stop | Cancels queued motion and sends zero-wheel plus a firmware-specific stop request | Whether every actuator stops on each firmware |
 

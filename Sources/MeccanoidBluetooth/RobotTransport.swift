@@ -35,7 +35,15 @@ protocol RobotTransport: AnyObject {
     func startScan()
     func stopScan()
     func connect(to id: UUID)
-    func send(_ data: Data, completion: @escaping (Result<Void, Error>) -> Void)
+    /// Reject an expired command before handing it to the platform. A command
+    /// already handed to CoreBluetooth cannot be recalled by this deadline.
+    func send(_ data: Data, notAfter: ContinuousClock.Instant?, completion: @escaping (Result<Void, Error>) -> Void)
     func cancelPendingWrites()
     func disconnect()
+}
+
+extension RobotTransport {
+    func send(_ data: Data, completion: @escaping (Result<Void, Error>) -> Void) {
+        send(data, notAfter: nil, completion: completion)
+    }
 }
