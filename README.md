@@ -2,7 +2,7 @@
 
 A native SwiftUI controller for Meccanoid robots on **iPhone, iPad and Mac**. It connects directly to the original MeccaBrain over Bluetooth Low Energy. No replacement controller, firmware flashing, browser, account or cloud service is required by this app.
 
-**Experimental alpha. The SwiftUI app still awaits a physical robot test.** On 4 November 2026, a separate native diagnostic connected to an original MeccaBrain, completed the PIN handshake, received status and position replies, and sent a red-eye command that the operator visually confirmed. This establishes that diagnostic's Bluetooth/eye-control path on one robot; it does not verify this app's transport or movement controls. No movement was commanded. See the [hardware evidence](docs/hardware-pilot.md#diagnostic-evidence-2026-11-04).
+**Experimental alpha. Physical control through the SwiftUI app is not yet verified.** On 4 November 2026, a separate native diagnostic connected to an original MeccaBrain, completed the PIN handshake, received status and position replies, and sent a red-eye command that the operator visually confirmed. The SwiftUI Mac app subsequently discovered the robot, but its connection attempt timed out. Neither controller rediscovered the robot afterward; the cause remains undetermined. No movement was commanded. See the [hardware evidence](docs/hardware-pilot.md#diagnostic-evidence-2026-11-04).
 
 Builds, automated checks and practice mode cannot establish joint travel, wheel direction or reliable stopping. Compatibility with each robot generation and firmware remains unverified.
 

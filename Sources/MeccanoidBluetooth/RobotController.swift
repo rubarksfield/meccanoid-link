@@ -84,8 +84,18 @@ public final class RobotController {
         deadlineTask?.cancel()
         deadlineTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(30))
-            guard !Task.isCancelled, let self, [.connecting, .handshaking].contains(self.phase) else { return }
-            self.fail("Connection timed out. If the robot asks, press its yellow button, then try again.")
+            guard !Task.isCancelled, let self else { return }
+            self.connectionTimedOut()
+        }
+    }
+
+    func connectionTimedOut() {
+        switch phase {
+        case .connecting:
+            fail("Connection timed out before the robot was ready. Check its power, move closer, then scan again.")
+        case .handshaking:
+            fail("Robot confirmation timed out. Press its yellow button if it asks to connect, then scan again.")
+        default: break
         }
     }
 
@@ -269,6 +279,7 @@ public final class RobotController {
         case .connected:
             guard phase == .connecting else { return }
             statusMessage = "Discovering robot controls…"
+            log("Bluetooth connected; discovering robot controls")
         case .subscribed:
             guard phase == .connecting else { return }
             phase = .handshaking; connectionDeadline()
@@ -333,6 +344,7 @@ public final class RobotController {
         // Set state before cancelling writes: cancellation callbacks must not
         // recursively start another failure or make a stale command look sent.
         resetSession(); phase = .failed; errorMessage = message; statusMessage = message
+        devices = []
         isDisconnecting = false
         transport.disconnect(); log(message)
     }

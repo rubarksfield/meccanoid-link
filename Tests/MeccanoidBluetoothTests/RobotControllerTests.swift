@@ -165,6 +165,82 @@ final class RobotControllerTests: XCTestCase {
         XCTAssertEqual(transport.writes.count, 3, "Duplicate PIN reply must not repeat startup actions")
     }
 
+    func testFailureClearsStaleRowsAndRequiresFreshDiscoveryForRetry() async {
+        let transport = FakeTransport()
+        let controller = connecting(transport)
+        let staleDevice = controller.devices[0]
+        transport.emit(.failed("Connection failed"))
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertTrue(controller.devices.isEmpty)
+        transport.emit(.discovered(staleDevice))
+        XCTAssertTrue(controller.devices.isEmpty, "Late scan events must not restore stale retry rows")
+        controller.connect(to: staleDevice.id)
+        XCTAssertEqual(transport.connectIDs.count, 1)
+
+        controller.startScan()
+        XCTAssertEqual(controller.phase, .scanning)
+        XCTAssertNil(controller.errorMessage)
+        transport.emit(.discovered(staleDevice))
+        controller.connect(to: staleDevice.id)
+        XCTAssertEqual(controller.phase, .connecting)
+        XCTAssertEqual(transport.connectIDs, [staleDevice.id, staleDevice.id])
+        transport.emit(.disconnected(nil))
+    }
+
+    func testConnectingTimeoutGivesPowerAndRescanAdviceWithoutYellowButton() async {
+        let transport = FakeTransport()
+        let controller = RobotController(transport: transport)
+        let device = DiscoveredRobot(id: UUID(), name: "MECCANOID TEST", rssi: -45)
+        controller.startScan()
+        transport.emit(.discovered(device))
+        controller.connect(to: device.id)
+        controller.connectionTimedOut()
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertTrue(controller.devices.isEmpty)
+        XCTAssertTrue(controller.errorMessage?.contains("power") == true)
+        XCTAssertTrue(controller.errorMessage?.contains("scan again") == true)
+        XCTAssertFalse(controller.errorMessage?.contains("yellow") == true)
+        XCTAssertEqual(transport.disconnectCount, 1)
+    }
+
+    func testHandshakeTimeoutMentionsTheRobotConfirmationButton() async {
+        let transport = FakeTransport()
+        let controller = connecting(transport)
+        XCTAssertEqual(controller.phase, .handshaking)
+        controller.connectionTimedOut()
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertTrue(controller.devices.isEmpty)
+        XCTAssertTrue(controller.errorMessage?.contains("yellow button") == true)
+        XCTAssertTrue(controller.errorMessage?.contains("scan again") == true)
+        XCTAssertEqual(transport.disconnectCount, 1)
+    }
+
+    func testExpiredConnectionDeadlineDoesNotFailAReadySession() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        controller.connectionTimedOut()
+        XCTAssertEqual(controller.phase, .ready)
+        XCTAssertNil(controller.errorMessage)
+        XCTAssertEqual(transport.disconnectCount, 0)
+    }
+
+    func testConnectedCallbackLogsBluetoothProgressBeforeHandshake() async {
+        let transport = FakeTransport()
+        let controller = RobotController(transport: transport)
+        let device = DiscoveredRobot(id: UUID(), name: "MECCANOID TEST", rssi: -45)
+        controller.startScan()
+        transport.emit(.discovered(device))
+        controller.connect(to: device.id)
+        XCTAssertFalse(controller.logs.contains { $0.contains("Bluetooth connected") })
+        transport.emit(.connected)
+        XCTAssertTrue(controller.logs.contains("Bluetooth connected; discovering robot controls"))
+        XCTAssertEqual(controller.phase, .connecting)
+        XCTAssertTrue(transport.writes.isEmpty, "A link connection alone must not send the PIN or enable controls")
+        XCTAssertFalse(controller.isConnected)
+        transport.emit(.disconnected(nil))
+    }
+
     func testHandshakeRequiresValidPinResponseAndHandlesExplicitRejection() async {
         let transport = FakeTransport()
         let controller = connecting(transport)

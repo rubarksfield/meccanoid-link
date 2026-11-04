@@ -1,6 +1,6 @@
 # First physical hardware pilot
 
-**Status: the SwiftUI-app pilot remains pending.** A separate native diagnostic has verified the handshake, replies and red eyes on one robot, as recorded below. An operator must be present for further hardware testing. Practice mode and simulator results are not hardware evidence.
+**Status: the SwiftUI-app pilot is incomplete.** A separate native diagnostic has verified the handshake, replies and red eyes on one robot, as recorded below. An operator must be present for further hardware testing. Practice mode and simulator results are not hardware evidence.
 
 ## Diagnostic evidence: 2026-11-04
 
@@ -16,6 +16,8 @@ The original MeccaBrain was first visible to the Mac as a Spin Master USB device
 | Movement | No movement commanded or tested |
 
 The red-eye observation verifies a physical effect through that diagnostic on this robot. The status codes are raw values, not calibrated battery measurements. This does not establish compatibility with other firmware, successful operation of this app's CoreBluetooth transport, mechanical limits or reliable stopping. The next pilot begins with this app's own handshake and eye-colour flow before any movement.
+
+The SwiftUI Mac app subsequently discovered the same robot, but its connection attempt timed out before notification subscription. A fresh scan from the app and a retry of the diagnostic did not rediscover the robot. The cause remains undetermined; a fresh normal startup and another app connection are needed. This attempt verifies app discovery only, not its handshake or eye controls.
 
 ## Prepare
 
