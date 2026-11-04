@@ -2,7 +2,7 @@
 
 These notes describe the current Swift implementation. The compatibility target is the original MeccaBrain's Bluetooth interface. This is separate from the serial Smart Module bus between the controller and individual servos.
 
-The implementation follows community protocol research and independently checked packet facts. [Third-party notices](../THIRD_PARTY_NOTICES.md) identifies the sources. On 2026-11-04, a separate upstream native diagnostic completed the handshake, received status and eight-slot pose replies, and produced operator-confirmed red eyes on an original MeccaBrain. [That diagnostic evidence](hardware-pilot.md#diagnostic-evidence-2026-11-04) supports the protocol path on one robot. The SwiftUI app and its own CoreBluetooth transport still await physical validation; no movement was commanded during the diagnostic.
+The implementation follows community protocol research and independently checked packet facts. [Third-party notices](../THIRD_PARTY_NOTICES.md) identifies the sources. On 2026-11-04, an upstream native diagnostic produced operator-confirmed red eyes. A separate test of this SwiftUI Mac app then completed its own connection and produced operator-confirmed blue eyes on the same model 91763 MeccaBrain. One small joint command was submitted, but its physical effect is not yet confirmed. See the [hardware evidence](hardware-pilot.md) for the distinction between submitted commands, replies and observed effects. iPhone/iPad hardware and physical stopping remain unverified.
 
 ## Bluetooth transport
 
