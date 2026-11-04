@@ -1,6 +1,6 @@
 # First physical hardware pilot
 
-**Status: native Mac connection, lights and driving are operator-confirmed. The corrected joint trial verified mode 2 before the target, but position feedback stayed unchanged; the operator's visual report is pending.** Wheel direction, physical pulse duration and stopping have not been independently verified. An operator must be present for further hardware testing. Practice mode and simulator results are not hardware evidence.
+**Status: native Mac connection, lights and driving are operator-confirmed. The operator reported no visible joint movement in either the corrected +3 trial or the 8-unit comparison.** A changed position display in the latter trial is not physical proof. Wheel direction, physical pulse duration and stopping have not been independently verified. An operator must be present for further hardware testing. Practice mode and simulator results are not hardware evidence.
 
 ## Diagnostic evidence: 2026-11-04
 
@@ -36,7 +36,7 @@ The first app connection attempt timed out before notification subscription. Nei
 
 Stop submission and disabled controls do not establish that every actuator physically stopped. No mechanical mapping, calibration, wheel-direction or lost-link stopping claim is made from this pilot.
 
-The flash is an observation, not confirmation that slot 3 drives the right elbow. The nudge path also changes servo mode and sends a complete pose, so the flashing module cannot yet establish the selected slot's mechanical identity. No increase in range was made in response to the failed movement test.
+The flash is an observation, not confirmation that slot 3 drives the right elbow. The nudge path also changes servo mode and sends a complete pose, so the flashing module cannot yet establish the selected slot's mechanical identity. No increase in range was made during those initial trials.
 
 The bounded refresh has now received a supervised physical test. It did not resolve the observed lack of movement, so it is not recorded as a movement fix. The operator separately confirmed that the robot's arms move normally through its onboard controls and voice commands.
 
@@ -67,13 +67,13 @@ The operator connected the physical robot to native Mac app commit `656a339`. Mo
 | **Read position** | The app sent only `09`; no `0B` mode-setting or `08` pose command was sent |
 | Second **Read robot layout** | The same configuration and mapping were returned, but mode was now 4 at those same indices |
 
-This physically verifies the native app's layout-reading interface and records a mode 2 → 4 change after the position read. It strongly supports a command-order fault in the old nudge path, which selected mode 2 before reading the pose and then sent the target. The app could therefore be sending the target after the pose read had left the servos in mode 4.
+This physically verifies the native app's layout-reading interface and records a mode 2 → 4 change across the `0A → 09 → 0A` sequence. A command-order effect is a candidate explanation, but the sequence did not isolate whether `0A` also changes servo state. It does not establish `09` as the sole cause.
 
-The implemented correction reads and freezes the current pose first, sends mode 2, requires a `0A` reply confirming mode 2 for the selected slot, and only then sends the bounded target. The ±3-unit limit is unchanged. Every target handoff must precede the frozen baseline's absolute two-second expiry; the refresh also lasts at most one second. Movement using this corrected sequence has not yet been physically confirmed. The mode observations above came from the native app; no separate CLI control session completed or issued additional pose or mode commands during that check.
+The implemented correction reads and freezes the current pose first, sends mode 2, requires a `0A` reply confirming mode 2 for the selected slot, and only then sends the bounded target. The subsequent trial retained the ±3-unit limit. Every target handoff must precede the frozen baseline's absolute two-second expiry; the refresh also lasts at most one second. Movement using this corrected sequence has not been physically confirmed. The mode observations above came from the native app; no separate CLI control session completed or issued additional pose or mode commands during that check.
 
 ## Corrected sequence verification
 
-The native Mac practice test completed **Find connected joints → blue eyes → confirm → enable movement → joint 1 +3 → Stop**. Simulated feedback changed from 128 to 131, and Stop disabled movement. The demo resets reported servo modes to 4 on `09`, reproducing the observed mode transition for this software test. Native Mac and unsigned iOS/iPadOS arm64 builds passed.
+The native Mac practice test completed **Find connected joints → blue eyes → confirm → enable movement → joint 1 +3 → Stop**. Simulated feedback changed from 128 to 131, and Stop disabled movement. The demo models one candidate explanation by resetting reported servo modes to 4 on `09`; this does not isolate the real firmware's `0A` behaviour. Native Mac and unsigned iOS/iPadOS arm64 builds passed.
 
 The current joint picker requires a layout reading and offers only configured servo entries among the first eight logical slots. It does not assign anatomical names or repair the missing mapping entry.
 
@@ -88,7 +88,26 @@ Bounded joint refresh finished after 9 frames
 Joint 3 feedback unchanged at 33 after target 36
 ```
 
-Stop was clicked and the app showed movement disabled. The operator's visual report for this trial is still pending. The unchanged feedback is recorded evidence; it is not a substitute for that visual observation. The corrected order and mode check executed, but the result does not establish that the command-order correction is sufficient to restore joint movement. No larger-delta comparison has been performed.
+Stop was clicked and the app showed movement disabled. The operator then confirmed: “Nothing moved; try eight units.” The unchanged feedback and visual report agree for this +3 trial. The corrected order and mode check executed, but they were not sufficient to produce observed movement in this test.
+
+The app defaults to 3-unit nudges and offers an explicit 8-unit selection; the controller bounds requests to ±8. The operator requested the comparison below. The pose-sampling order, mode checks, pacing and deadlines were unchanged so the selected comparison changed only the delta.
+
+## Eight-unit comparison: 2026-11-04
+
+The first attempt on joint 3 reported mode 4 instead of the required mode 2. The guard blocked the attempt, sent no `08` pose command and disabled movement. A retry on the same connection completed the nudge flow. The captured app log records:
+
+```text
+Joint 3 reported mode 2 before its position command
+Joint 3 target 30 → 38 accepted for bounded refresh
+Bounded joint refresh finished after 9 frames
+Joint 3 feedback 30 → 33 after target 38
+```
+
+Stop was clicked, `0D` and `19` stop requests were logged, and movement was confirmed disabled in the app. A later Bluetooth disconnect cleared motion state; the UI showed a timeout. The operator reported “No visible movement.” Feedback changed from 30 to 33, below target 38, but does not establish an achieved eight-unit change or visible physical joint movement. Joint control and possible side effects of the `0A` mode query remain unresolved.
+
+## Visual hardware observations
+
+The controller label confirms model 91763. Connections are visible at ports 1–4, with ports 5–8 empty. The Robot selector appears to be in its left position; its selected mode has not been independently established. A red servo indicator is visible, but its colour alone does not establish an error, control mode or movement. These observations do not establish electrical continuity or anatomical mapping.
 
 ## Prepare
 
@@ -110,7 +129,7 @@ The app labels joints as numbered logical slots because wiring and mechanics can
 
 1. Keep movement disabled and choose **Find connected joints**. Wait for the layout reading to finish.
 2. Select one offered slot and arrange support and clearance for the entire robot. Complete the eye-confirmation step, then explicitly enable movement.
-3. Choose one small nudge. The app obtains a fresh pose and verifies control mode before sending the target; observe which part moves and in which direction.
+3. Start with the default 3-unit nudge. The separate 8-unit selection is for an explicit bounded comparison. The app obtains a fresh pose and verifies control mode before sending the target; observe which part moves and in which direction.
 4. Stop if the response is unexpected, a joint strains or another part moves. Use the physical power switch if needed.
 5. Record the starting raw position, requested change and observed result. A returned position value alone is not proof of correct wiring or mechanical clearance.
 

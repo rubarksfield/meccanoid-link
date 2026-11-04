@@ -973,12 +973,33 @@ final class RobotControllerTests: XCTestCase {
         let controller = ready(transport)
         defer { transport.emit(.disconnected(nil)) }
         enable(controller, transport: transport)
-        for (position, delta) in [(0, 1), (24, -1), (232, 1), (255, -1)] {
+        for (position, delta) in [(0, 1), (24, -1), (232, 1), (255, -1), (31, -8), (225, 8)] {
             transport.writes.removeAll()
             controller.jog(slot: 0, delta: delta)
             transport.emit(.received(poseReply([UInt8(position), 110, 120, 130, 140, 150, 160, 170])))
             XCTAssertFalse(transport.writes.contains { $0.first == 8 || $0.first == 0x0B })
             XCTAssertFalse(controller.motionBusy)
+        }
+    }
+
+    func testEightUnitNudgesPreserveEveryUnselectedPosition() async throws {
+        for delta in [-8, 8] {
+            let transport = FakeTransport()
+            let controller = ready(transport)
+            defer { transport.emit(.disconnected(nil)) }
+            enable(controller, transport: transport)
+            transport.writes.removeAll()
+            controller.jog(slot: 2, delta: delta)
+            let baseline: [UInt8] = [100, 110, 120, 130, 140, 150, 160, 170]
+            transport.emit(.received(poseReply(baseline)))
+            XCTAssertFalse(transport.writes.contains { $0.first == 8 }, "Even an explicitly selected eight-unit jog must await mode confirmation")
+            confirmMode(transport)
+            var expected = baseline
+            expected[2] = UInt8(120 + delta)
+            XCTAssertEqual(transport.writes.map { $0.first! }, [9, 0x0B, 0x0A, 8])
+            XCTAssertEqual(transport.writes.last, try MeccanoidPacket.pose(expected))
+            XCTAssertEqual(controller.positions, baseline, "Feedback must remain measured rather than claim the requested target")
+            XCTAssertTrue(controller.motionBusy)
         }
     }
 
@@ -988,7 +1009,10 @@ final class RobotControllerTests: XCTestCase {
         defer { transport.emit(.disconnected(nil)) }
         enable(controller, transport: transport)
         transport.writes.removeAll()
-        for (slot, delta) in [(-1, 1), (8, 1), (0, -4), (0, 4), (0, 0)] {
+        for (slot, delta) in [
+            (-1, 1), (8, 1), (Int.min, 1), (Int.max, 1),
+            (0, -9), (0, 9), (0, Int.min), (0, Int.max), (0, 0)
+        ] {
             controller.jog(slot: slot, delta: delta)
         }
         XCTAssertTrue(transport.writes.isEmpty)

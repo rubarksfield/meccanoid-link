@@ -2,11 +2,11 @@
 
 A native SwiftUI controller for Meccanoid robots on **iPhone, iPad and Mac**. It connects directly to the original MeccaBrain over Bluetooth Low Energy. No replacement controller, firmware flashing, browser, account or cloud service is required by this app.
 
-**Experimental alpha. The operator confirms that driving commands and lights work through the native Mac app on one model 91763 MeccaBrain. Joint movement with the corrected command order is not yet physically confirmed.** Wheel direction, physical pulse duration and stopping have not been independently verified. Physical iPhone/iPad control remains untested.
+**Experimental alpha. The operator confirms that driving commands and lights work through the native Mac app on one model 91763 MeccaBrain, but reports no visible movement from the corrected +3 trial or the 8-unit comparison.** Wheel direction, physical pulse duration and stopping have not been independently verified. Physical iPhone/iPad control remains untested.
 
-The app's connection and blue-eye change were confirmed on 4 November 2026. Earlier single-write and bounded-refresh tests produced no confirmed joint movement: the operator observed only a light flash, and position feedback stayed unchanged. The operator reports normal arm movement through the robot's onboard controls and voice commands. Native diagnostics later showed control mode 2 changing to mode 4 after a position read. The app now reads the pose first, then sets and verifies mode 2 before sending the target, with the same ±3-unit limit.
+The app's connection and blue-eye change were confirmed on 4 November 2026. Earlier single-write and bounded-refresh tests produced no confirmed joint movement: the operator observed only a light flash, and position feedback stayed unchanged. The operator reports normal arm movement through the robot's onboard controls and voice commands. Native diagnostics later reported mode 2 before a position read and mode 4 afterwards; the cause within that diagnostic sequence is not fully isolated. The app now reads the pose first, then sets and verifies mode 2 before sending the target. Nudges default to 3 raw units, with an 8-unit option for a bounded comparison.
 
-Practice feedback changed from 128 to 131. In the corrected physical trial, joint 3 reported mode 2 before a nine-frame refresh from 33 toward 36, but feedback remained 33; the operator's visual report is pending. Joint movement and the separate mapping discrepancy remain unresolved. See the [hardware evidence](docs/hardware-pilot.md).
+Practice feedback changed from 128 to 131. In the corrected physical +3 trial, joint 3 reported mode 2 before a nine-frame refresh from 33 toward 36, but feedback remained 33 and the operator confirmed that nothing moved. The first 8-unit attempt was blocked by a mode mismatch. A retry reported mode 2, sent target 30 → 38 over nine refresh frames, and returned feedback 33; the operator again reported no visible movement. A changed readback is not physical proof; joint movement and the mapping discrepancy remain unresolved. See the [hardware evidence](docs/hardware-pilot.md).
 
 Builds, automated checks and practice mode cannot establish joint travel, wheel direction or reliable stopping. Compatibility with each robot generation and firmware remains unverified.
 
@@ -66,7 +66,7 @@ The initial movement limits are intentionally small:
 
 | Control | App behaviour | What remains unknown |
 | --- | --- | --- |
-| Joint nudge | At most ±3 raw units after a fresh complete pose and mode-2 confirmation; up to one second of identical target refreshes, all within the frozen baseline's two-second expiry | Physical movement, joint identity, degrees, direction and mechanical limits |
+| Joint nudge | Default 3 raw units, selectable 8; controller bound ±8. Fresh pose and mode-2 confirmation, then up to one second of identical target refreshes within the frozen baseline's two-second expiry | Physical movement, joint identity, degrees, direction and mechanical limits |
 | Wheels | At most ±40 raw PWM units; schedules zero-speed after 250 ms | Actual speed, direction and physical pulse duration |
 | Stop | Cancels queued motion and sends zero-wheel plus a firmware-specific stop request | Whether every actuator stops on each firmware |
 

@@ -261,8 +261,8 @@ public final class RobotController {
         guard !poseRequestPending, !modeRequestPending else {
             report("Wait for the current joint reading before nudging."); return
         }
-        guard (0..<8).contains(slot), (-3...3).contains(delta), delta != 0 else {
-            report("Joint nudges must be between −3 and +3 raw units."); return
+        guard (0..<8).contains(slot), (-8...8).contains(delta), delta != 0 else {
+            report("Joint nudges must be between −8 and +8 raw units."); return
         }
         guard diagnostics != nil else {
             report("Disable movement and read the robot layout before nudging a joint."); return

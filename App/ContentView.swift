@@ -7,6 +7,7 @@ struct ContentView: View {
     let isDemo: Bool
 
     @State private var selectedJoint = 0
+    @State private var nudgeSize = 3
     @State private var showingDetails = false
 
     private let eyeColours: [EyeColour] = [
@@ -66,7 +67,7 @@ struct ContentView: View {
             }
         }
         .onChange(of: controller.isConnected) { _, connected in
-            if !connected { selectedJoint = 0 }
+            if !connected { selectedJoint = 0; nudgeSize = 3 }
         }
     }
 
@@ -376,9 +377,17 @@ struct ContentView: View {
                 }
             }
 
+            Picker("Nudge size", selection: $nudgeSize) {
+                Text("3 units").tag(3)
+                Text("8 units").tag(8)
+            }
+            .pickerStyle(.segmented)
+            .disabled(controller.motionBusy)
+            .accessibilityIdentifier("nudgeSizePicker")
+
             HStack(spacing: 10) {
-                jointButton("Nudge −", delta: -3)
-                jointButton("Nudge +", delta: 3)
+                jointButton("Nudge −", delta: -nudgeSize)
+                jointButton("Nudge +", delta: nudgeSize)
             }
             .disabled(!controller.motionEnabled || currentJoint == nil || currentPosition == nil || controller.motionBusy)
 
@@ -387,6 +396,11 @@ struct ContentView: View {
                  : "The app checks control mode before sending a tiny nudge. Slot numbers do not identify body parts.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if nudgeSize == 8 {
+                Text("Eight raw units is a larger test, not an angle in degrees. Keep the joint clear and Stop within reach.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -520,7 +534,7 @@ struct ContentView: View {
             Text(title).frame(maxWidth: .infinity, minHeight: 28)
         }
         .buttonStyle(.bordered)
-        .accessibilityLabel(currentJoint.map { "Nudge joint \($0 + 1) \(delta < 0 ? "down" : "up") three units" } ?? "Find connected joints before nudging")
+        .accessibilityLabel(currentJoint.map { "Nudge joint \($0 + 1) \(delta < 0 ? "down" : "up") \(abs(delta)) units" } ?? "Find connected joints before nudging")
         .accessibilityIdentifier(delta < 0 ? "jogMinusButton" : "jogPlusButton")
     }
 
