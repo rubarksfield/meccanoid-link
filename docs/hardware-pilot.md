@@ -27,8 +27,9 @@ The first app connection attempt timed out before notification subscription. Nei
 | Blue eyes | Blue button used in the app; operator explicitly confirmed blue eyes |
 | Eye gate | Operator confirmed the visible change in the app |
 | Position read | App received joint-position data |
-| Joint nudge | With operator readiness confirmed, isolated +3 raw-unit nudges requested for slot 3; app logged accepted mode and pose writes; feedback remained 33. On the observed retry the operator reported no movement, but a right-elbow light flash |
-| Stop | Stop requested after the nudge; zero-wheel and stop-preset writes accepted; app visibly disabled movement |
+| Initial single-write nudges | With operator readiness confirmed, isolated +3 raw-unit nudges requested for UI slot 3; app logged accepted mode and pose writes; feedback remained 33. On the observed retry the operator reported no movement, but a right-elbow light flash |
+| Bounded refresh retry | Ten identical pose frames requested UI slot 3 from 33 to 36 within one second. Feedback remained 33; the operator reported only a light flash and no movement |
+| Stop | Stop requested after the bounded retry; the app visibly disabled movement |
 | Wheels | No nonzero wheel command requested |
 | iPhone/iPad hardware | Not tested; builds do not establish physical Bluetooth operation |
 
@@ -36,7 +37,22 @@ Stop submission and disabled controls do not establish that every actuator physi
 
 The flash is an observation, not confirmation that slot 3 drives the right elbow. The nudge path also changes servo mode and sends a complete pose, so the flashing module cannot yet establish the selected slot's mechanical identity. No increase in range was made in response to the failed movement test.
 
-The next software revision refreshes the same small target for a bounded one-second window, based on the original app's repeated-write behaviour. This timing change still needs a supervised physical test; it is not recorded as a movement fix.
+The bounded refresh has now received a supervised physical test. It did not resolve the observed lack of movement, so it is not recorded as a movement fix. The operator separately confirmed that the robot's arms move normally through its onboard controls and voice commands.
+
+## Read-only follow-up: 2026-11-04
+
+A separate diagnostic read configuration, logical mapping and servo mode after the failed movement trial. It disconnected after the reads. No mapping or firmware write was made, and the wiring was not changed.
+
+| Read | Evidence |
+| --- | --- |
+| Configuration `02` | Servos detected at CH1A, CH1B, CH3A and CH4A; eyes detected at CH2A |
+| Reply `03` | All-zero data |
+| Logical map | `22 21 20 00 01 02 10 11`, followed by eight `FF` entries |
+| Mode `0A` | Value 4 only at zero-based logical indices 2, 3 and 4, corresponding to UI slots 3, 4 and 5 |
+
+The map includes three of the four detected servos; CH4A is missing. This discrepancy is confirmed, but the tested UI slot 3 already maps to CH3A, a detected servo. The discrepancy alone is therefore insufficient to explain that slot's lack of movement. The mode readback is evidence of the later diagnostic state, not proof of what caused the trial to fail.
+
+The app now implements **Read robot layout** under Connection details and has passed native Mac and unsigned iOS/iPadOS arm64 builds. The Mac practice interface was checked with a simulated robot; it displayed the inventory, mapping and mode codes while movement remained disabled. It reads detected modules, logical slots and reported modes with movement disabled. The native diagnostic interface has not yet been tested against the physical robot; the observations above came from the separate command-line diagnostic. This feature does not repair mappings, and the lack of joint movement remains unresolved.
 
 ## Prepare
 

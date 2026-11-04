@@ -64,6 +64,9 @@ public enum RobotReply: Equatable, Sendable {
     case pin(accepted: Bool)
     case status(RobotStatus)
     case pose([UInt8])
+    case modules(bank: RobotModuleBank, types: [UInt8])
+    case servoMapping([UInt8])
+    case servoModes([UInt8])
     /// The 17 payload bytes, excluding the command and checksum.
     case other(command: UInt8, payload: [UInt8])
 }

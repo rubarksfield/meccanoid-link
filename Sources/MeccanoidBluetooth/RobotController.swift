@@ -17,6 +17,9 @@ public final class RobotController {
     public private(set) var errorMessage: String?
     public private(set) var robotStatus: RobotStatus?
     public private(set) var motionBusy = false
+    public private(set) var diagnostics: RobotDiagnostics?
+    public private(set) var diagnosticsBusy = false
+    public private(set) var diagnosticsMessage = "Read the detected modules and joint slots without moving the robot."
     public var isConnected: Bool { phase == .ready }
 
     @ObservationIgnored private let transport: RobotTransport
@@ -36,6 +39,9 @@ public final class RobotController {
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var isDisconnecting = false
     @ObservationIgnored private var heartbeatPending = false
+    @ObservationIgnored private var diagnosticsTask: Task<Void, Never>?
+    @ObservationIgnored private var diagnosticsPendingCommand: UInt8?
+    @ObservationIgnored private var diagnosticsReplies: [UInt8: [UInt8]] = [:]
 
     private struct JogRefresh {
         let id = UUID()
@@ -152,6 +158,9 @@ public final class RobotController {
 
     public func setMotionEnabled(_ enabled: Bool) {
         if !enabled { stop(); return }
+        guard !diagnosticsBusy else {
+            report("Wait for the robot layout reading before enabling movement."); return
+        }
         guard isConnected, !isDisconnecting, eyesConfirmed else {
             report("First send an eye colour and confirm you saw it on your robot."); return
         }
@@ -164,6 +173,60 @@ public final class RobotController {
     public func refreshPose() {
         guard isConnected, !isDisconnecting, !motionBusy, !poseRequestPending, pendingJog == nil else { return }
         requestPose()
+    }
+
+    /// These four requests only read configuration, mapping and reported modes.
+    /// Keep one request outstanding; the wire protocol has no request identifiers.
+    public func inspectRobot() {
+        guard isConnected, !isDisconnecting, !diagnosticsBusy, !motionEnabled, !motionBusy else { return }
+        diagnostics = nil; diagnosticsReplies = [:]; diagnosticsBusy = true
+        diagnosticsMessage = "Reading the robot layout…"
+        diagnosticsTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled, let self else { return }
+            self.diagnosticsTimedOut()
+        }
+        requestDiagnostics(command: 0x02)
+    }
+
+    func diagnosticsTimedOut() {
+        guard diagnosticsBusy else { return }
+        // Do not retry on the same connection: a delayed reply could otherwise
+        // be mistaken for the new reading.
+        fail("The robot layout reading timed out. Reconnect before trying again.")
+    }
+
+    private func requestDiagnostics(command: UInt8) {
+        diagnosticsPendingCommand = command
+        switch command {
+        case 0x02: send(MeccanoidPacket.readModules(.channels1to4), quiet: true)
+        case 0x03: send(MeccanoidPacket.readModules(.channels5to8), quiet: true)
+        case 0x20: send(MeccanoidPacket.readServoMapping(), quiet: true)
+        case 0x0A: send(MeccanoidPacket.readServoModes(), quiet: true)
+        default: preconditionFailure("Unexpected diagnostic request")
+        }
+    }
+
+    private func receiveDiagnostics(command: UInt8, values: [UInt8]) {
+        guard diagnosticsBusy, !isDisconnecting, diagnosticsPendingCommand == command else { return }
+        diagnosticsReplies[command] = values
+        switch command {
+        case 0x02: requestDiagnostics(command: 0x03)
+        case 0x03: requestDiagnostics(command: 0x20)
+        case 0x20: requestDiagnostics(command: 0x0A)
+        case 0x0A:
+            guard let first = diagnosticsReplies[0x02], let second = diagnosticsReplies[0x03],
+                  let mapping = diagnosticsReplies[0x20],
+                  let snapshot = RobotDiagnostics(firstBank: first, secondBank: second, mapping: mapping, modes: values) else {
+                fail("The robot returned an incomplete layout. Reconnect before trying again."); return
+            }
+            diagnostics = snapshot
+            diagnosticsBusy = false; diagnosticsPendingCommand = nil
+            diagnosticsTask?.cancel(); diagnosticsTask = nil; diagnosticsReplies = [:]
+            diagnosticsMessage = "\(snapshot.servoCount) servos reported. This reading does not identify which body part each one moves."
+            log("Read robot layout: \(snapshot.servoCount) servos, \(snapshot.unmappedServoAddresses.count) outside the returned mapping")
+        default: break
+        }
     }
 
     private func requestPose() {
@@ -303,7 +366,7 @@ public final class RobotController {
         guard isConnected, !isDisconnecting, motionEnabled, eyesConfirmed else {
             report("Enable movement after confirming the eyes."); return false
         }
-        guard !motionBusy else { return false }
+        guard !motionBusy, !diagnosticsBusy else { return false }
         errorMessage = nil; return true
     }
 
@@ -382,6 +445,9 @@ public final class RobotController {
                         statusMessage = "Joint feedback received. Check whether the intended part moved."
                     } else if pendingJog != nil { completeJog(with: values) }
                 case .status(let value): robotStatus = value
+                case .modules(let bank, let types): receiveDiagnostics(command: bank.rawValue, values: types)
+                case .servoMapping(let values): receiveDiagnostics(command: 0x20, values: values)
+                case .servoModes(let values): receiveDiagnostics(command: 0x0A, values: values)
                 default: break
                 }
             }
@@ -433,6 +499,10 @@ public final class RobotController {
         poseReadTask = nil; poseRequestPending = false; jogSampleRequested = false
         jogDeadlineTask = nil; jogRefresh = nil; jogReadbackPending = false
         positions = nil; robotStatus = nil; lastEyeColor = nil; lastReplyAt = nil; heartbeatPending = false
+        diagnosticsTask?.cancel(); diagnosticsTask = nil
+        diagnosticsPendingCommand = nil; diagnosticsReplies = [:]
+        diagnostics = nil; diagnosticsBusy = false
+        diagnosticsMessage = "Read the detected modules and joint slots without moving the robot."
         transport.cancelPendingWrites()
     }
 

@@ -2,7 +2,7 @@
 
 A native SwiftUI controller for Meccanoid robots on **iPhone, iPad and Mac**. It connects directly to the original MeccaBrain over Bluetooth Low Energy. No replacement controller, firmware flashing, browser, account or cloud service is required by this app.
 
-**Experimental alpha. Bluetooth connection and blue eyes are physically confirmed through the native Mac app on one model 91763 MeccaBrain.** The operator confirmed the blue-eye change on 4 November 2026. Small joint nudges have not produced confirmed movement: the operator observed a right-elbow light flash, and the reported position stayed unchanged. Wheels and physical iPhone/iPad control remain untested. See the [hardware evidence](docs/hardware-pilot.md).
+**Experimental alpha. Bluetooth connection and blue eyes are physically confirmed through the native Mac app on one model 91763 MeccaBrain.** The operator confirmed the blue-eye change on 4 November 2026. Neither a single joint-pose write nor the bounded ten-frame refresh produced confirmed movement: the operator observed only a light flash, and position feedback stayed unchanged. The operator reports normal arm movement through the robot's onboard controls and voice commands. A read-only diagnostic found a logical mapping discrepancy, but it has not been established as the cause of the tested slot's failure. Wheels and physical iPhone/iPad control remain untested. See the [hardware evidence](docs/hardware-pilot.md).
 
 Builds, automated checks and practice mode cannot establish joint travel, wheel direction or reliable stopping. Compatibility with each robot generation and firmware remains unverified.
 
@@ -12,12 +12,15 @@ The initial target is the stock G15/G15KS-era MeccaBrain interface, including th
 
 - Explicit Bluetooth scanning, robot selection, service discovery and PIN handshake.
 - Eye-colour commands with operator confirmation before movement can be enabled.
+- Read-only robot layout showing detected modules, logical joint slots and reported modes while movement is disabled.
 - Eight raw servo slots, with fresh position reads before small joint nudges.
 - Short wheel-pulse controls and a prominent Stop action.
 - Connection timeouts, status polling and reset of movement permission on disconnect.
 - Practice mode with a simulated robot and no Bluetooth access.
 
 The app uses only Apple frameworks and the local Swift package in this repository. There are no external Swift package dependencies, analytics, network requests or downloaded runtime assets. Bluetooth permission is requested when you choose to scan. Diagnostics stay in memory for the current app session.
+
+The **Read robot layout** feature builds for Mac and iPhone/iPad and has been checked through the native Mac practice interface. Its native app interface has not yet been tested against the physical robot; the mapping evidence above came from a separate read-only command-line diagnostic. It does not repair mappings or establish which body part a slot moves.
 
 ## Build and run
 

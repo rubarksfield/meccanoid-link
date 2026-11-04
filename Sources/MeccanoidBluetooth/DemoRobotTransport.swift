@@ -8,6 +8,7 @@ final class DemoRobotTransport: RobotTransport {
     private let id = UUID(uuidString: "00000000-0000-0000-0000-000000000001")!
     private var connected = false
     private var pose = Array(repeating: UInt8(128), count: 8)
+    private var modes = Array(repeating: UInt8(4), count: 8) + Array(repeating: UInt8(0), count: 8)
 
     func startScan() {
         onEvent?(.bluetooth("Practice mode · no Bluetooth"))
@@ -28,6 +29,11 @@ final class DemoRobotTransport: RobotTransport {
         switch data.first {
         case 0x1a: onEvent?(.received(MeccanoidPacket.pin()))
         case 0x01: onEvent?(.received(frame(1, payload: [])))
+        case 0x02: onEvent?(.received(frame(2, payload: [1, 1, 1, 0, 1, 1, 2, 0, 1, 1, 1, 0, 0, 0, 0, 0])))
+        case 0x03: onEvent?(.received(frame(3, payload: Array(repeating: 0, count: 16))))
+        case 0x20: onEvent?(.received(frame(0x20, payload: [0x22, 0x21, 0x20, 0, 1, 2, 0x10, 0x11] + Array(repeating: 255, count: 8))))
+        case 0x0A: onEvent?(.received(frame(0x0A, payload: modes)))
+        case 0x0B: modes = Array(data.dropFirst().prefix(8)) + Array(repeating: 0, count: 8)
         case 0x09: onEvent?(.received(frame(9, payload: pose)))
         case 0x08: pose = Array(data.dropFirst().prefix(8))
         default: break

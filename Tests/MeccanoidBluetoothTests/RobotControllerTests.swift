@@ -136,6 +136,149 @@ final class RobotControllerTests: XCTestCase {
         data("01 04 00 01 0a 07 00 00 00 00 07 72 04 00 14 00 00 00 00 a8")
     }
 
+    // Anonymized replies from the four-servo hardware pilot. No guessed pose or
+    // module writes are needed to discover the incomplete returned mapping.
+    private var layoutReplies: [Data] {
+        [
+            data("02 01 01 00 00 02 00 00 00 01 00 00 00 01 00 00 00 00 00 08"),
+            data("03 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 03"),
+            data("20 22 21 20 00 01 02 10 11 ff ff ff ff ff ff ff ff 00 08 9f"),
+            data("0a 00 00 04 04 04 00 00 00 00 00 00 00 00 00 00 00 00 00 16")
+        ]
+    }
+
+    func testLayoutReadIsSerialAndOnlyReadsUntilCompleteSnapshot() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        let start = transport.writes.count
+        controller.inspectRobot()
+        XCTAssertTrue(controller.diagnosticsBusy)
+        XCTAssertNil(controller.diagnostics)
+        XCTAssertEqual(transport.writes.count, start + 1)
+        controller.inspectRobot()
+        XCTAssertEqual(transport.writes.count, start + 1, "Duplicate reads must not overlap")
+        // Neither an unsolicited later reply nor malformed expected data should
+        // complete a stage or seed the snapshot.
+        transport.emit(.received(layoutReplies[2]))
+        transport.emit(.received(layoutReplies[0].dropLast()))
+        XCTAssertEqual(transport.writes.count, start + 1)
+        for (index, reply) in layoutReplies.enumerated() {
+            transport.emit(.received(reply))
+            XCTAssertEqual(transport.writes.count, start + min(index + 2, 4))
+            if index < 3 { XCTAssertNil(controller.diagnostics) }
+        }
+        XCTAssertEqual(Array(transport.writes.dropFirst(start)), [
+            MeccanoidPacket.readModules(.channels1to4), MeccanoidPacket.readModules(.channels5to8),
+            MeccanoidPacket.readServoMapping(), MeccanoidPacket.readServoModes()
+        ])
+        let snapshot = try XCTUnwrap(controller.diagnostics)
+        XCTAssertEqual(snapshot.servoCount, 4)
+        XCTAssertEqual(snapshot.firstEightMappedServoSlots.map(\.slotIndex), [2, 3, 4])
+        XCTAssertEqual(snapshot.unmappedServoAddresses.map(\.rawValue), [0x30])
+        XCTAssertFalse(controller.diagnosticsBusy)
+        XCTAssertFalse(controller.motionEnabled)
+        XCTAssertNil(controller.positions)
+    }
+
+    func testLayoutReadCannotStartDisconnectedOrWithMovementEnabled() async {
+        let transport = FakeTransport()
+        let disconnected = RobotController(transport: transport)
+        disconnected.inspectRobot()
+        XCTAssertTrue(transport.writes.isEmpty)
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        let count = transport.writes.count
+        controller.inspectRobot()
+        XCTAssertFalse(controller.diagnosticsBusy)
+        XCTAssertEqual(transport.writes.count, count)
+    }
+
+    func testLayoutReadBlocksEnablingMotionAndStopDoesNotLoseReadObligation() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        controller.setEyes(red: 0, green: 0, blue: 7, name: "Blue")
+        controller.confirmEyes()
+        controller.inspectRobot()
+        controller.stop()
+        XCTAssertTrue(controller.diagnosticsBusy)
+        controller.setMotionEnabled(true)
+        XCTAssertFalse(controller.motionEnabled)
+        for reply in layoutReplies { transport.emit(.received(reply)) }
+        XCTAssertNotNil(controller.diagnostics)
+        controller.setMotionEnabled(true)
+        XCTAssertTrue(controller.motionEnabled)
+    }
+
+    func testLayoutTimeoutDisconnectsAndIgnoresLateReplies() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        controller.inspectRobot()
+        transport.emit(.received(layoutReplies[0]))
+        controller.diagnosticsTimedOut()
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertEqual(transport.disconnectCount, 1)
+        XCTAssertFalse(controller.diagnosticsBusy)
+        XCTAssertNil(controller.diagnostics)
+        let count = transport.writes.count
+        for reply in layoutReplies { transport.emit(.received(reply)) }
+        controller.inspectRobot()
+        XCTAssertEqual(transport.writes.count, count)
+        XCTAssertNil(controller.diagnostics)
+    }
+
+    func testDisconnectDoesNotAdvanceLayoutReadsDuringStopGracePeriod() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        controller.inspectRobot()
+        controller.disconnect()
+        let count = transport.writes.count
+        for reply in layoutReplies { transport.emit(.received(reply)) }
+        XCTAssertEqual(transport.writes.count, count, "Disconnect must not schedule more diagnostic reads")
+        XCTAssertNil(controller.diagnostics)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertFalse(controller.diagnosticsBusy)
+        XCTAssertEqual(transport.disconnectCount, 1)
+    }
+
+    func testNewLayoutReadAndDisconnectClearPriorSnapshot() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        controller.inspectRobot()
+        for reply in layoutReplies { transport.emit(.received(reply)) }
+        XCTAssertNotNil(controller.diagnostics)
+        controller.inspectRobot()
+        XCTAssertNil(controller.diagnostics, "Old layout must not look like a fresh reading")
+        transport.emit(.received(layoutReplies[0]))
+        transport.emit(.disconnected(nil))
+        XCTAssertFalse(controller.diagnosticsBusy)
+        XCTAssertNil(controller.diagnostics)
+        for reply in layoutReplies { transport.emit(.received(reply)) }
+        XCTAssertNil(controller.diagnostics)
+    }
+
+    func testPracticeLayoutReadUsesSamePublicFlowWithoutMoving() async throws {
+        let controller = RobotController(demo: true)
+        controller.startScan()
+        controller.connect(to: try XCTUnwrap(controller.devices.first).id)
+        controller.refreshPose()
+        let before = controller.positions
+        controller.inspectRobot()
+        let snapshot = try XCTUnwrap(controller.diagnostics)
+        XCTAssertEqual(snapshot.servoCount, 8)
+        XCTAssertTrue(snapshot.unmappedServoAddresses.isEmpty)
+        XCTAssertEqual(snapshot.firstEightMappedServoSlots.count, 8)
+        XCTAssertEqual(Array(snapshot.modes.prefix(8)), Array(repeating: 4, count: 8))
+        controller.refreshPose()
+        XCTAssertEqual(controller.positions, before)
+        XCTAssertFalse(controller.motionEnabled)
+        XCTAssertFalse(controller.diagnosticsBusy)
+        controller.disconnect()
+    }
+
     private func poseReply(_ positions: [UInt8]) -> Data {
         precondition(positions.count == 8)
         var bytes: [UInt8] = [9] + positions + Array(repeating: 0, count: 9)

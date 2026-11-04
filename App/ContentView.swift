@@ -233,7 +233,7 @@ struct ContentView: View {
                 set: { controller.setMotionEnabled($0) }
             ))
             .font(.subheadline.weight(.semibold))
-            .disabled(!controller.isConnected || !controller.eyesConfirmed)
+            .disabled(!controller.isConnected || !controller.eyesConfirmed || controller.diagnosticsBusy)
             .accessibilityIdentifier("motionToggle")
 
             Text(movementGuidance)
@@ -369,6 +369,8 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Bluetooth: \(controller.bluetoothStatus)")
                     .font(.footnote)
+                robotLayoutDetails
+                Divider()
                 if controller.logs.isEmpty {
                     Text("Connection activity will appear here.")
                         .foregroundStyle(.secondary)
@@ -393,6 +395,56 @@ struct ContentView: View {
         .background(.background, in: RoundedRectangle(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(.primary.opacity(0.07)))
         .accessibilityIdentifier("connectionDetails")
+    }
+
+    private var robotLayoutDetails: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button(action: controller.inspectRobot) {
+                Label(controller.diagnosticsBusy ? "Reading robot layout…" : "Read robot layout", systemImage: "list.bullet.rectangle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(!controller.isConnected || controller.motionEnabled || controller.motionBusy || controller.diagnosticsBusy)
+            .accessibilityIdentifier("readRobotLayoutButton")
+
+            Text(controller.motionEnabled ? "Disable movement to read the robot layout." : controller.diagnosticsMessage)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let snapshot = controller.diagnostics {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Detected modules").font(.caption.weight(.semibold))
+                    ForEach(snapshot.modules.filter { $0.typeCode != 0 }, id: \.address.rawValue) { module in
+                        Text("\(module.address.displayName): \(module.typeDescription)")
+                            .font(.caption)
+                    }
+                    Text("Joint slots").font(.caption.weight(.semibold)).padding(.top, 4)
+                    ForEach(Array(snapshot.mappedSlots.prefix(8)), id: \.slotIndex) { slot in
+                        Text("Slot \(slot.slotIndex + 1): \(slot.summary) · mode \(slot.modeCode)")
+                            .font(.caption.monospacedDigit())
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if !snapshot.unmappedServoAddresses.isEmpty {
+                        Text("Servos outside the returned mapping: \(snapshot.unmappedServoAddresses.map(\.displayName).joined(separator: ", ")).")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text("Modes are raw reported codes. Reading this layout does not change wiring, mapping or servo mode.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .textSelection(.enabled)
+                .accessibilityIdentifier("robotLayoutSnapshot")
+            }
+            if let status = controller.robotStatus {
+                Text("Latest status packet: \(status.raw.map { String(format: "%02X", $0) }.joined(separator: " "))")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private func eyeButton(_ colour: EyeColour) -> some View {

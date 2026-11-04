@@ -39,6 +39,19 @@ public enum MeccanoidPacket {
         frame(command: 0x09)
     }
 
+    public static func readModules(_ bank: RobotModuleBank) -> Data {
+        frame(command: bank.rawValue)
+    }
+
+    /// Getter only. No mapping-setter command is exposed by this codec.
+    public static func readServoMapping() -> Data {
+        frame(command: 0x20)
+    }
+
+    public static func readServoModes() -> Data {
+        frame(command: 0x0A)
+    }
+
     /// Preset 8 is STOP in the community-tested G15KS firmware bank.
     /// This is a firmware-specific request, not a guaranteed emergency stop.
     public static func stopPreset() -> Data {
@@ -111,6 +124,14 @@ public enum MeccanoidPacket {
             ))
         case 0x09:
             return .pose(Array(bytes[1...8]))
+        case 0x02:
+            return .modules(bank: .channels1to4, types: Array(bytes[1...16]))
+        case 0x03:
+            return .modules(bank: .channels5to8, types: Array(bytes[1...16]))
+        case 0x20:
+            return .servoMapping(Array(bytes[1...16]))
+        case 0x0A:
+            return .servoModes(Array(bytes[1...16]))
         default:
             return .other(command: bytes[0], payload: Array(bytes[1...17]))
         }
