@@ -1,0 +1,29 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report toolchain
+        run: xcodebuild -version
+      - name: Test protocol and controller package
+        run: swift test
+      - name: Build native macOS app
+        run: >-
+          xcodebuild -project MeccanoidLink.xcodeproj -scheme MeccanoidLink
+          -configuration Debug -destination 'generic/platform=macOS'
+          -derivedDataPath .build/ci-macos CODE_SIGNING_ALLOWED=NO build
+      - name: Build iPhone and iPad app for Simulator
+        run: >-
+          xcodebuild -project MeccanoidLink.xcodeproj -scheme MeccanoidLink
+          -configuration Debug -destination 'generic/platform=iOS Simulator'
+          -derivedDataPath .build/ci-ios CODE_SIGNING_ALLOWED=NO build
