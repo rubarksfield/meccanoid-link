@@ -1,6 +1,6 @@
 # First physical hardware pilot
 
-**Status: native Mac connection and blue eyes confirmed; movement validation incomplete.** An operator must be present for further hardware testing. Practice mode and simulator results are not hardware evidence.
+**Status: native Mac connection, lights and driving are operator-confirmed. The corrected joint trial verified mode 2 before the target, but position feedback stayed unchanged; the operator's visual report is pending.** Wheel direction, physical pulse duration and stopping have not been independently verified. An operator must be present for further hardware testing. Practice mode and simulator results are not hardware evidence.
 
 ## Diagnostic evidence: 2026-11-04
 
@@ -30,7 +30,8 @@ The first app connection attempt timed out before notification subscription. Nei
 | Initial single-write nudges | With operator readiness confirmed, isolated +3 raw-unit nudges requested for UI slot 3; app logged accepted mode and pose writes; feedback remained 33. On the observed retry the operator reported no movement, but a right-elbow light flash |
 | Bounded refresh retry | Ten identical pose frames requested UI slot 3 from 33 to 36 within one second. Feedback remained 33; the operator reported only a light flash and no movement |
 | Stop | Stop requested after the bounded retry; the app visibly disabled movement |
-| Wheels | No nonzero wheel command requested |
+| Wheels | In a subsequent report, the operator confirmed that the driving commands work. Direction, physical pulse duration, Stop and timeout behaviour were not independently verified |
+| Operator report before the mode-order fix | Lights work, but joint controls produce no visible movement. The operator suggested that the nudge might be too small; this remains a hypothesis |
 | iPhone/iPad hardware | Not tested; builds do not establish physical Bluetooth operation |
 
 Stop submission and disabled controls do not establish that every actuator physically stopped. No mechanical mapping, calibration, wheel-direction or lost-link stopping claim is made from this pilot.
@@ -38,6 +39,8 @@ Stop submission and disabled controls do not establish that every actuator physi
 The flash is an observation, not confirmation that slot 3 drives the right elbow. The nudge path also changes servo mode and sends a complete pose, so the flashing module cannot yet establish the selected slot's mechanical identity. No increase in range was made in response to the failed movement test.
 
 The bounded refresh has now received a supervised physical test. It did not resolve the observed lack of movement, so it is not recorded as a movement fix. The operator separately confirmed that the robot's arms move normally through its onboard controls and voice commands.
+
+The later operator report establishes observed driving and lighting operation on this robot. It does not establish calibrated wheel speed, correct directional labels, reliable stopping or operation after a timeout. The joint controls remain unresolved; a larger nudge has not been established as the remedy.
 
 ## Read-only follow-up: 2026-11-04
 
@@ -52,7 +55,40 @@ A separate diagnostic read configuration, logical mapping and servo mode after t
 
 The map includes three of the four detected servos; CH4A is missing. This discrepancy is confirmed, but the tested UI slot 3 already maps to CH3A, a detected servo. The discrepancy alone is therefore insufficient to explain that slot's lack of movement. The mode readback is evidence of the later diagnostic state, not proof of what caused the trial to fail.
 
-The app now implements **Read robot layout** under Connection details and has passed native Mac and unsigned iOS/iPadOS arm64 builds. The Mac practice interface was checked with a simulated robot; it displayed the inventory, mapping and mode codes while movement remained disabled. It reads detected modules, logical slots and reported modes with movement disabled. The native diagnostic interface has not yet been tested against the physical robot; the observations above came from the separate command-line diagnostic. This feature does not repair mappings, and the lack of joint movement remains unresolved.
+The app implements **Read robot layout** under Connection details and has passed native Mac and unsigned iOS/iPadOS arm64 builds. The Mac practice interface displayed simulated inventory, mapping and mode codes while movement remained disabled. The native diagnostic interface was subsequently checked against the physical robot as described below. It does not repair mappings or establish a slot's mechanical identity.
+
+## Native app mode check: 2026-11-04
+
+The operator connected the physical robot to native Mac app commit `656a339`. Movement remained disabled throughout this check.
+
+| Step | Commands and observation |
+| --- | --- |
+| First **Read robot layout** | `02 → 03 → 20 → 0A` returned mode 2 at zero-based logical indices 2, 3 and 4, corresponding to UI slots 3, 4 and 5 |
+| **Read position** | The app sent only `09`; no `0B` mode-setting or `08` pose command was sent |
+| Second **Read robot layout** | The same configuration and mapping were returned, but mode was now 4 at those same indices |
+
+This physically verifies the native app's layout-reading interface and records a mode 2 → 4 change after the position read. It strongly supports a command-order fault in the old nudge path, which selected mode 2 before reading the pose and then sent the target. The app could therefore be sending the target after the pose read had left the servos in mode 4.
+
+The implemented correction reads and freezes the current pose first, sends mode 2, requires a `0A` reply confirming mode 2 for the selected slot, and only then sends the bounded target. The ±3-unit limit is unchanged. Every target handoff must precede the frozen baseline's absolute two-second expiry; the refresh also lasts at most one second. Movement using this corrected sequence has not yet been physically confirmed. The mode observations above came from the native app; no separate CLI control session completed or issued additional pose or mode commands during that check.
+
+## Corrected sequence verification
+
+The native Mac practice test completed **Find connected joints → blue eyes → confirm → enable movement → joint 1 +3 → Stop**. Simulated feedback changed from 128 to 131, and Stop disabled movement. The demo resets reported servo modes to 4 on `09`, reproducing the observed mode transition for this software test. Native Mac and unsigned iOS/iPadOS arm64 builds passed.
+
+The current joint picker requires a layout reading and offers only configured servo entries among the first eight logical slots. It does not assign anatomical names or repair the missing mapping entry.
+
+## Corrected sequence physical trial: 2026-11-04
+
+The operator restarted the robot and reconnected the corrected app. **Find connected joints** offered UI slot 3 as a configured servo. Movement was armed for an operator-supervised +3 trial from baseline 33 to target 36. The app recorded:
+
+```text
+Joint 3 reported mode 2 before its position command
+Joint 3 target 33 → 36 accepted for bounded refresh
+Bounded joint refresh finished after 9 frames
+Joint 3 feedback unchanged at 33 after target 36
+```
+
+Stop was clicked and the app showed movement disabled. The operator's visual report for this trial is still pending. The unchanged feedback is recorded evidence; it is not a substitute for that visual observation. The corrected order and mode check executed, but the result does not establish that the command-order correction is sufficient to restore joint movement. No larger-delta comparison has been performed.
 
 ## Prepare
 
@@ -70,12 +106,13 @@ Record the robot generation, controller model and firmware if available. Do not 
 
 ## Establish one joint at a time
 
-The app labels joints as numbered slots because wiring and mechanics can differ. It does not know the physical neutral position or safe travel of your build.
+The app labels joints as numbered logical slots because wiring and mechanics can differ. Only configured servo entries among the first eight slots are offered after discovery. The app does not know their anatomical identity, physical neutral position or safe travel.
 
-1. Arrange support and clearance for the entire robot, then explicitly enable movement.
-2. Read the positions. Select one populated slot, choose a single small nudge and observe which part moved and in which direction.
-3. Stop if the response is unexpected, a joint strains or another part moves. Use the physical power switch if needed.
-4. Record the starting raw position, requested change and observed result. A returned position value alone is not proof of correct wiring or mechanical clearance.
+1. Keep movement disabled and choose **Find connected joints**. Wait for the layout reading to finish.
+2. Select one offered slot and arrange support and clearance for the entire robot. Complete the eye-confirmation step, then explicitly enable movement.
+3. Choose one small nudge. The app obtains a fresh pose and verifies control mode before sending the target; observe which part moves and in which direction.
+4. Stop if the response is unexpected, a joint strains or another part moves. Use the physical power switch if needed.
+5. Record the starting raw position, requested change and observed result. A returned position value alone is not proof of correct wiring or mechanical clearance.
 
 Do not sweep to the protocol endpoints to discover limits. Mechanical calibration is separate future work. The alpha does not automatically restore a baseline pose after a nudge.
 

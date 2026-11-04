@@ -21,6 +21,9 @@ public final class RobotController {
     public private(set) var diagnosticsBusy = false
     public private(set) var diagnosticsMessage = "Read the detected modules and joint slots without moving the robot."
     public var isConnected: Bool { phase == .ready }
+    public var availableJointSlots: [RobotMappedSlot] {
+        diagnostics?.firstEightMappedServoSlots ?? []
+    }
 
     @ObservationIgnored private let transport: RobotTransport
     @ObservationIgnored private let now: () -> Date
@@ -29,9 +32,12 @@ public final class RobotController {
     @ObservationIgnored private var actionTask: Task<Void, Never>?
     @ObservationIgnored private var disconnectTask: Task<Void, Never>?
     @ObservationIgnored private var poseReadTask: Task<Void, Never>?
+    @ObservationIgnored private var modeReadTask: Task<Void, Never>?
+    @ObservationIgnored private var modeRequestPending = false
+    @ObservationIgnored private var preparedJog: PreparedJog?
     @ObservationIgnored private var jogDeadlineTask: Task<Void, Never>?
     @ObservationIgnored private var jogRefresh: JogRefresh?
-    @ObservationIgnored private var jogReadbackPending = false
+    @ObservationIgnored private var jogReadback: (slot: Int, before: Int, target: Int)?
     @ObservationIgnored private var poseRequestPending = false
     @ObservationIgnored private var jogSampleRequested = false
     @ObservationIgnored private var lastReplyAt: Date?
@@ -42,6 +48,15 @@ public final class RobotController {
     @ObservationIgnored private var diagnosticsTask: Task<Void, Never>?
     @ObservationIgnored private var diagnosticsPendingCommand: UInt8?
     @ObservationIgnored private var diagnosticsReplies: [UInt8: [UInt8]] = [:]
+
+    private struct PreparedJog {
+        let id = UUID()
+        let packet: Data
+        let deadline: ContinuousClock.Instant
+        let slot: Int
+        let before: Int
+        let target: Int
+    }
 
     private struct JogRefresh {
         let id = UUID()
@@ -178,7 +193,7 @@ public final class RobotController {
     /// These four requests only read configuration, mapping and reported modes.
     /// Keep one request outstanding; the wire protocol has no request identifiers.
     public func inspectRobot() {
-        guard isConnected, !isDisconnecting, !diagnosticsBusy, !motionEnabled, !motionBusy else { return }
+        guard isConnected, !isDisconnecting, !diagnosticsBusy, !motionEnabled, !motionBusy, !modeRequestPending else { return }
         diagnostics = nil; diagnosticsReplies = [:]; diagnosticsBusy = true
         diagnosticsMessage = "Reading the robot layout…"
         diagnosticsTask = Task { [weak self] in
@@ -243,49 +258,92 @@ public final class RobotController {
 
     public func jog(slot: Int, delta: Int) {
         guard canBeginMotion() else { return }
-        guard !poseRequestPending else {
-            report("Wait for the current position reading before nudging."); return
+        guard !poseRequestPending, !modeRequestPending else {
+            report("Wait for the current joint reading before nudging."); return
         }
         guard (0..<8).contains(slot), (-3...3).contains(delta), delta != 0 else {
             report("Joint nudges must be between −3 and +3 raw units."); return
         }
-        motionBusy = true; pendingJog = (slot, delta); positions = nil; jogSampleRequested = false
-        do {
-            // Sample again after entering control mode. Never send a guessed or
-            // cached complete pose, and preserve every unselected returned slot.
-            send(try MeccanoidPacket.servoMode(2)) { [weak self] in
-                guard let self, self.pendingJog != nil, self.motionEnabled else { return }
-                self.jogSampleRequested = true
-                self.requestPose()
-            }
-        } catch { stop(); report(error.localizedDescription) }
+        guard diagnostics != nil else {
+            report("Disable movement and read the robot layout before nudging a joint."); return
+        }
+        guard availableJointSlots.contains(where: { $0.slotIndex == slot && $0.isConfiguredServo }) else {
+            report("This slot is not a configured servo in the current robot layout."); return
+        }
+        motionBusy = true; pendingJog = (slot, delta); positions = nil; jogSampleRequested = true
+        // The original client reads the complete pose before requesting control
+        // mode. Never insert another pose read between mode confirmation and 08.
+        requestPose()
     }
 
     private func completeJog(with positions: [UInt8]) {
         guard let jog = pendingJog, jogSampleRequested, motionEnabled, !isDisconnecting else { return }
         pendingJog = nil; jogSampleRequested = false; actionTask?.cancel()
         let before = Int(positions[jog.slot]), target = before + jog.delta
-        // These are protocol limits, not a claim about any joint's mechanical
-        // travel. Initial exploration is deliberately limited to three raw units.
+        // These are protocol limits, not a claim about mechanical travel.
         guard (24...232).contains(before), (24...232).contains(target) else {
             motionBusy = false; report("This slot is absent or outside the supported nudge range."); return
         }
         var pose = positions; pose[jog.slot] = UInt8(target)
         do {
-            // Freeze the complete target once. Repetition never adds another delta.
-            let refresh = JogRefresh(
+            let prepared = PreparedJog(
                 packet: try MeccanoidPacket.pose(pose),
-                deadline: ContinuousClock.now.advanced(by: .seconds(1)),
+                deadline: ContinuousClock.now.advanced(by: .seconds(2)),
                 slot: jog.slot, before: before, target: target
             )
-            jogRefresh = refresh
-            jogDeadlineTask = Task { [weak self] in
-                try? await ContinuousClock().sleep(until: refresh.deadline)
-                guard !Task.isCancelled, let self else { return }
-                self.finishJogRefresh(id: refresh.id)
+            preparedJog = prepared
+            modeReadTask = Task { [weak self] in
+                try? await ContinuousClock().sleep(until: prepared.deadline)
+                guard !Task.isCancelled, let self,
+                      self.modeRequestPending || self.preparedJog?.id == prepared.id else { return }
+                self.stop()
+                self.fail("No timely joint-mode confirmation arrived. Reconnect before trying a nudge.")
             }
-            sendJogFrame(id: refresh.id)
-        } catch { motionBusy = false; report(error.localizedDescription) }
+            send(try MeccanoidPacket.servoMode(2), notAfter: prepared.deadline) { [weak self] in
+                guard let self, self.preparedJog?.id == prepared.id, self.motionEnabled else { return }
+                guard ContinuousClock.now < prepared.deadline else {
+                    self.stop(); self.fail("The joint baseline expired before mode confirmation. Reconnect before trying again.")
+                    return
+                }
+                self.modeRequestPending = true
+                self.statusMessage = "Checking the selected joint's reported mode…"
+                self.send(MeccanoidPacket.readServoModes(), quiet: true, notAfter: prepared.deadline)
+            }
+        } catch { stop(); report(error.localizedDescription) }
+    }
+
+    private func receiveJogModes(_ values: [UInt8]) {
+        guard modeRequestPending else { return }
+        // Drain this obligation even after Stop. Without request identifiers, a
+        // new nudge must not consume an older mode response as its confirmation.
+        modeRequestPending = false
+        modeReadTask?.cancel(); modeReadTask = nil
+        guard let prepared = preparedJog, motionEnabled, !isDisconnecting else { return }
+        preparedJog = nil
+        guard ContinuousClock.now < prepared.deadline else {
+            stop(); report("The joint baseline expired before mode confirmation. Try a new nudge."); return
+        }
+        let mode = values[prepared.slot]
+        guard mode == 2 else {
+            stop()
+            report("Joint \(prepared.slot + 1) reported mode \(mode); expected 2. No position command was sent. Movement is disabled.")
+            return
+        }
+        log("Joint \(prepared.slot + 1) reported mode 2 before its position command")
+        // Repetition never adds another delta or extends the frozen baseline's
+        // lifetime, including a first frame queued behind transport backpressure.
+        let refresh = JogRefresh(
+            packet: prepared.packet,
+            deadline: min(prepared.deadline, ContinuousClock.now.advanced(by: .seconds(1))),
+            slot: prepared.slot, before: prepared.before, target: prepared.target
+        )
+        jogRefresh = refresh
+        jogDeadlineTask = Task { [weak self] in
+            try? await ContinuousClock().sleep(until: refresh.deadline)
+            guard !Task.isCancelled, let self else { return }
+            self.finishJogRefresh(id: refresh.id)
+        }
+        sendJogFrame(id: refresh.id)
     }
 
     private func sendJogFrame(id: UUID) {
@@ -336,7 +394,7 @@ public final class RobotController {
             try? await Task.sleep(for: .milliseconds(500))
             guard !Task.isCancelled, let self, self.generation == epoch,
                   self.isConnected, self.motionEnabled, !self.isDisconnecting else { return }
-            self.jogReadbackPending = true
+            self.jogReadback = (refresh.slot, refresh.before, refresh.target)
             self.requestPose()
         }
     }
@@ -373,10 +431,12 @@ public final class RobotController {
     public func stop() {
         generation += 1; actionTask?.cancel(); actionTask = nil
         jogDeadlineTask?.cancel(); jogDeadlineTask = nil; jogRefresh = nil
-        jogReadbackPending = false
+        jogReadback = nil
         heartbeatPending = false
         pendingJog = nil; motionBusy = false; motionEnabled = false
-        jogSampleRequested = false
+        jogSampleRequested = false; preparedJog = nil
+        // Keep an already requested mode read and its deadline until it drains.
+        if !modeRequestPending { modeReadTask?.cancel(); modeReadTask = nil }
         transport.cancelPendingWrites()
         guard isConnected else { return }
         send(MeccanoidPacket.zeroWheels())
@@ -440,14 +500,23 @@ public final class RobotController {
                     guard poseRequestPending else { return }
                     poseRequestPending = false; poseReadTask?.cancel(); poseReadTask = nil
                     positions = values
-                    if jogReadbackPending {
-                        jogReadbackPending = false; motionBusy = false
-                        statusMessage = "Joint feedback received. Check whether the intended part moved."
+                    if let readback = jogReadback {
+                        jogReadback = nil; motionBusy = false
+                        let measured = Int(values[readback.slot])
+                        if measured == readback.before {
+                            statusMessage = "Joint feedback stayed at \(measured). No movement is confirmed."
+                            log("Joint \(readback.slot + 1) feedback unchanged at \(measured) after target \(readback.target)")
+                        } else {
+                            statusMessage = "Joint feedback received. Check whether the intended part moved."
+                            log("Joint \(readback.slot + 1) feedback \(readback.before) → \(measured) after target \(readback.target)")
+                        }
                     } else if pendingJog != nil { completeJog(with: values) }
                 case .status(let value): robotStatus = value
                 case .modules(let bank, let types): receiveDiagnostics(command: bank.rawValue, values: types)
                 case .servoMapping(let values): receiveDiagnostics(command: 0x20, values: values)
-                case .servoModes(let values): receiveDiagnostics(command: 0x0A, values: values)
+                case .servoModes(let values):
+                    if modeRequestPending { receiveJogModes(values) }
+                    else { receiveDiagnostics(command: 0x0A, values: values) }
                 default: break
                 }
             }
@@ -497,7 +566,9 @@ public final class RobotController {
         deadlineTask = nil; heartbeatTask = nil; actionTask = nil; disconnectTask = nil
         pendingJog = nil; motionBusy = false; motionEnabled = false; eyesConfirmed = false
         poseReadTask = nil; poseRequestPending = false; jogSampleRequested = false
-        jogDeadlineTask = nil; jogRefresh = nil; jogReadbackPending = false
+        modeReadTask?.cancel(); modeReadTask = nil
+        modeRequestPending = false; preparedJog = nil
+        jogDeadlineTask = nil; jogRefresh = nil; jogReadback = nil
         positions = nil; robotStatus = nil; lastEyeColor = nil; lastReplyAt = nil; heartbeatPending = false
         diagnosticsTask?.cancel(); diagnosticsTask = nil
         diagnosticsPendingCommand = nil; diagnosticsReplies = [:]

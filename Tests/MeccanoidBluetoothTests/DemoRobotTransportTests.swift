@@ -57,4 +57,39 @@ final class DemoRobotTransportTests: XCTestCase {
         XCTAssertTrue(accepted)
         XCTAssertEqual(try readPose(transport), target)
     }
+
+    func testModeReadTriggeredByWriteCompletionSeesUpdatedMode() throws {
+        let transport = try connectedTransport()
+        var modes: [UInt8]?
+        transport.onEvent = { event in
+            if case .received(let data) = event,
+               case .servoModes(let values)? = MeccanoidPacket.decode(data) {
+                modes = values
+            }
+        }
+        transport.send(try MeccanoidPacket.servoMode(2)) { result in
+            if case .failure(let error) = result { XCTFail(error.localizedDescription); return }
+            transport.send(MeccanoidPacket.readServoModes()) { result in
+                if case .failure(let error) = result { XCTFail(error.localizedDescription) }
+            }
+        }
+        XCTAssertEqual(modes, Array(repeating: 2, count: 8) + Array(repeating: 0, count: 8))
+    }
+
+    func testPositionReadReturnsServosToReadModeAsObservedOnPilotRobot() throws {
+        let transport = try connectedTransport()
+        var modes: [UInt8]?
+        transport.onEvent = { event in
+            if case .received(let data) = event,
+               case .servoModes(let values)? = MeccanoidPacket.decode(data) {
+                modes = values
+            }
+        }
+        transport.send(try MeccanoidPacket.servoMode(2)) { _ in }
+        transport.send(MeccanoidPacket.readServoModes()) { _ in }
+        XCTAssertEqual(modes?.prefix(8), Array(repeating: UInt8(2), count: 8)[...])
+        transport.send(MeccanoidPacket.readPose()) { _ in }
+        transport.send(MeccanoidPacket.readServoModes()) { _ in }
+        XCTAssertEqual(modes?.prefix(8), Array(repeating: UInt8(4), count: 8)[...])
+    }
 }

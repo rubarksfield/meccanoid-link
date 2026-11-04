@@ -321,16 +321,40 @@ struct ContentView: View {
             HStack {
                 Text("One joint at a time").font(.subheadline.weight(.semibold))
                 Spacer()
-                Picker("Joint", selection: $selectedJoint) {
-                    ForEach(0..<8) { slot in
-                        Text("Joint \(slot + 1)").tag(slot)
+                if !controller.availableJointSlots.isEmpty {
+                    Picker("Joint", selection: Binding(
+                        get: { currentJoint ?? -1 },
+                        set: { selectedJoint = $0 }
+                    )) {
+                        ForEach(controller.availableJointSlots, id: \.slotIndex) { slot in
+                            Text("Joint slot \(slot.slotIndex + 1)").tag(slot.slotIndex)
+                        }
                     }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .accessibilityLabel("Choose detected joint")
+                    .accessibilityIdentifier("jointPicker")
+                    .disabled(controller.motionBusy)
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .accessibilityLabel("Choose joint")
-                .accessibilityIdentifier("jointPicker")
-                .disabled(controller.motionBusy)
+            }
+
+            Button(controller.motionEnabled ? "Stop and find connected joints" : "Find connected joints") {
+                if controller.motionEnabled { controller.stop() }
+                controller.inspectRobot()
+            }
+            .buttonStyle(.bordered)
+            .disabled(!controller.isConnected || controller.motionBusy || controller.diagnosticsBusy)
+            .accessibilityIdentifier("findJointsButton")
+
+            if controller.diagnosticsBusy {
+                Text("Reading connected joints…").font(.caption).foregroundStyle(.secondary)
+            } else if let layout = controller.diagnostics {
+                Text("\(controller.availableJointSlots.count) joint slots available from \(layout.servoCount) detected servos.")
+                    .font(.caption).foregroundStyle(.secondary)
+                if !layout.unmappedServoAddresses.isEmpty {
+                    Text("Some servos are missing from the robot’s slot mapping. They cannot be selected here yet.")
+                        .font(.caption).foregroundStyle(.orange)
+                }
             }
 
             HStack(spacing: 10) {
@@ -356,9 +380,11 @@ struct ContentView: View {
                 jointButton("Nudge −", delta: -3)
                 jointButton("Nudge +", delta: 3)
             }
-            .disabled(!controller.motionEnabled || currentPosition == nil || controller.motionBusy)
+            .disabled(!controller.motionEnabled || currentJoint == nil || currentPosition == nil || controller.motionBusy)
 
-            Text("Read the position, then try a tiny nudge. Check which joint moves on your robot.")
+            Text(controller.diagnostics == nil
+                 ? "Find connected joints first. Only slots reporting a servo will be offered."
+                 : "The app checks control mode before sending a tiny nudge. Slot numbers do not identify body parts.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -488,12 +514,13 @@ struct ContentView: View {
 
     private func jointButton(_ title: String, delta: Int) -> some View {
         Button {
-            controller.jog(slot: selectedJoint, delta: delta)
+            guard let slot = currentJoint else { return }
+            controller.jog(slot: slot, delta: delta)
         } label: {
             Text(title).frame(maxWidth: .infinity, minHeight: 28)
         }
         .buttonStyle(.bordered)
-        .accessibilityLabel("Nudge joint \(selectedJoint + 1) \(delta < 0 ? "down" : "up") three units")
+        .accessibilityLabel(currentJoint.map { "Nudge joint \($0 + 1) \(delta < 0 ? "down" : "up") three units" } ?? "Find connected joints before nudging")
         .accessibilityIdentifier(delta < 0 ? "jogMinusButton" : "jogPlusButton")
     }
 
@@ -508,8 +535,13 @@ struct ContentView: View {
     }
 
     private var currentPosition: UInt8? {
-        guard let positions = controller.positions, positions.indices.contains(selectedJoint) else { return nil }
-        return positions[selectedJoint]
+        guard let slot = currentJoint, let positions = controller.positions, positions.indices.contains(slot) else { return nil }
+        return positions[slot]
+    }
+
+    private var currentJoint: Int? {
+        controller.availableJointSlots.first(where: { $0.slotIndex == selectedJoint })?.slotIndex
+            ?? controller.availableJointSlots.first?.slotIndex
     }
 
     private var selectedEyeColour: Color {

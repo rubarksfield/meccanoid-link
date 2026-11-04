@@ -94,6 +94,8 @@ final class RobotControllerTests: XCTestCase {
         XCTAssertFalse(controller.motionEnabled)
         XCTAssertNotNil(controller.robotStatus)
 
+        controller.inspectRobot()
+        XCTAssertEqual(controller.availableJointSlots.count, 8)
         controller.setEyes(red: 7, green: 0, blue: 0, name: "Red")
         XCTAssertEqual(controller.lastEyeColor, "Red")
         XCTAssertFalse(controller.eyesConfirmed)
@@ -279,6 +281,27 @@ final class RobotControllerTests: XCTestCase {
         controller.disconnect()
     }
 
+    private func reply(command: UInt8, values: [UInt8]) -> Data {
+        precondition(values.count <= 17)
+        var bytes = [command] + values + Array(repeating: UInt8(0), count: 17 - values.count)
+        let sum = bytes.reduce(0) { $0 + Int($1) }
+        bytes += [UInt8(sum >> 8), UInt8(sum & 255)]
+        return Data(bytes)
+    }
+
+    private var fullLayoutReplies: [Data] {
+        [
+            reply(command: 2, values: Array(repeating: 1, count: 8) + Array(repeating: 0, count: 8)),
+            reply(command: 3, values: Array(repeating: 0, count: 16)),
+            reply(command: 0x20, values: [0, 1, 2, 3, 0x10, 0x11, 0x12, 0x13] + Array(repeating: 0xFF, count: 8)),
+            reply(command: 0x0A, values: Array(repeating: 4, count: 8) + Array(repeating: 0, count: 8))
+        ]
+    }
+
+    private func confirmMode(_ transport: FakeTransport) {
+        transport.emit(.received(reply(command: 0x0A, values: Array(repeating: 2, count: 8) + Array(repeating: 0, count: 8))))
+    }
+
     private func poseReply(_ positions: [UInt8]) -> Data {
         precondition(positions.count == 8)
         var bytes: [UInt8] = [9] + positions + Array(repeating: 0, count: 9)
@@ -297,8 +320,8 @@ final class RobotControllerTests: XCTestCase {
 
     /// Deliberately prevents the actor's expiry Task from running. A queued
     /// transport must still enforce each packet's deadline when it becomes ready.
-    private func stallActorForDeadlineTest() {
-        Thread.sleep(forTimeInterval: 1.05)
+    private func stallActorForDeadlineTest(seconds: TimeInterval = 1.05) {
+        Thread.sleep(forTimeInterval: seconds)
     }
 
     private func connecting(_ transport: FakeTransport, clock: TestClock? = nil) -> RobotController {
@@ -320,7 +343,11 @@ final class RobotControllerTests: XCTestCase {
         return controller
     }
 
-    private func enable(_ controller: RobotController, transport: FakeTransport) {
+    private func enable(_ controller: RobotController, transport: FakeTransport, withLayout: Bool = true) {
+        if withLayout, controller.diagnostics == nil {
+            controller.inspectRobot()
+            fullLayoutReplies.forEach { transport.emit(.received($0)) }
+        }
         controller.setEyes(red: 7, green: 0, blue: 0, name: "Red")
         controller.confirmEyes()
         controller.setMotionEnabled(true)
@@ -492,22 +519,203 @@ final class RobotControllerTests: XCTestCase {
         XCTAssertFalse(controller.motionBusy)
     }
 
-    func testJogIgnoresStalePoseUntilPostModeSampleIsRequested() async throws {
+    func testJointInventoryIsRequiredButWheelGatesRemainUnchanged() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport, withLayout: false)
+        transport.writes.removeAll()
+        controller.jog(slot: 0, delta: 1)
+        XCTAssertTrue(controller.availableJointSlots.isEmpty)
+        XCTAssertTrue(transport.writes.isEmpty)
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertTrue(controller.errorMessage?.contains("robot layout") == true)
+        controller.drive(left: 40, right: 40)
+        XCTAssertEqual(transport.writes.first, try MeccanoidPacket.wheels(left: 40, right: 40))
+        XCTAssertTrue(controller.motionBusy)
+    }
+
+    func testJointSelectionOnlyIncludesConfiguredServosFromCurrentSession() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        controller.inspectRobot()
+        layoutReplies.forEach { transport.emit(.received($0)) }
+        enable(controller, transport: transport)
+        XCTAssertEqual(controller.availableJointSlots.map(\.slotIndex), [2, 3, 4])
+        transport.writes.removeAll()
+        for slot in [0, 1, 5, 6, 7] {
+            controller.jog(slot: slot, delta: 1)
+            XCTAssertTrue(transport.writes.isEmpty, "Empty slots and the mapped LED cannot receive a jog")
+            XCTAssertFalse(controller.motionBusy)
+        }
+        controller.jog(slot: 2, delta: 1)
+        XCTAssertEqual(transport.writes, [MeccanoidPacket.readPose()])
+        transport.emit(.disconnected(nil))
+        XCTAssertTrue(controller.availableJointSlots.isEmpty)
+        XCTAssertNil(controller.diagnostics)
+    }
+
+    func testUnknownModuleTypeAndInvalidMappingCannotBecomeJointChoices() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        controller.inspectRobot()
+        transport.emit(.received(reply(command: 2, values: [0x77] + Array(repeating: 1, count: 15))))
+        transport.emit(.received(reply(command: 3, values: Array(repeating: 1, count: 16))))
+        transport.emit(.received(reply(command: 0x20, values: [0, 0xFF, 0x04, 0x80] + Array(repeating: 0xFF, count: 12))))
+        confirmMode(transport)
+        enable(controller, transport: transport)
+        transport.writes.removeAll()
+        XCTAssertTrue(controller.availableJointSlots.isEmpty)
+        for slot in 0..<8 { controller.jog(slot: slot, delta: 1) }
+        XCTAssertTrue(transport.writes.isEmpty)
+        XCTAssertFalse(controller.motionBusy)
+    }
+
+    func testSelectedModeMustBeTwoEvenWhenOtherServosReportTwo() async {
+        for selectedMode: UInt8 in [0, 4, 0xFF] {
+            let transport = FakeTransport()
+            let controller = ready(transport)
+            enable(controller, transport: transport)
+            transport.writes.removeAll()
+            controller.jog(slot: 2, delta: 3)
+            transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+            var modes = Array(repeating: UInt8(2), count: 16)
+            modes[2] = selectedMode
+            transport.emit(.received(reply(command: 0x0A, values: modes)))
+            XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+            XCTAssertEqual(transport.writes.filter { $0.first == 9 }.count, 1)
+            XCTAssertFalse(controller.motionEnabled)
+            XCTAssertFalse(controller.motionBusy)
+            XCTAssertEqual(controller.phase, .ready)
+            XCTAssertTrue(controller.errorMessage?.contains("reported mode \(selectedMode); expected 2") == true)
+            transport.emit(.disconnected(nil))
+        }
+    }
+
+    func testStopRetainsModeReadObligationAndBlocksDiagnosticReadUntilDrained() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        XCTAssertEqual(transport.writes.last, MeccanoidPacket.readServoModes())
+        controller.stop()
+        var count = transport.writes.count
+        controller.inspectRobot()
+        XCTAssertEqual(transport.writes.count, count)
+        XCTAssertFalse(controller.diagnosticsBusy)
+        controller.setMotionEnabled(true)
+        transport.emit(.received(poseReply([101, 110, 120, 130, 140, 150, 160, 170])))
+        count = transport.writes.count
+        controller.jog(slot: 0, delta: 1)
+        XCTAssertEqual(transport.writes.count, count, "Rearming cannot reuse the pending mode read")
+        confirmMode(transport)
+        XCTAssertEqual(transport.writes.count, count, "A cancelled jog's late mode reply only drains its obligation")
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+        controller.jog(slot: 0, delta: 1)
+        XCTAssertEqual(transport.writes.last, MeccanoidPacket.readPose())
+        transport.emit(.received(poseReply([101, 110, 120, 130, 140, 150, 160, 170])))
+        XCTAssertEqual(transport.writes.last, MeccanoidPacket.readServoModes())
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+        confirmMode(transport)
+        XCTAssertEqual(transport.writes.last?.first, 8)
+    }
+
+    func testStopKeepsModeDeadlineAndMalformedReplyCannotSatisfyIt() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        let malformed = reply(command: 0x0A, values: Array(repeating: 2, count: 16)).dropLast()
+        transport.emit(.received(malformed))
+        controller.stop()
+        controller.setMotionEnabled(true)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        let failed = await waitUntil { controller.phase == .failed }
+        XCTAssertTrue(failed)
+        XCTAssertTrue(controller.errorMessage?.contains("joint-mode confirmation") == true)
+        XCTAssertEqual(transport.disconnectCount, 1)
+        XCTAssertFalse(controller.motionEnabled)
+        let count = transport.writes.count
+        confirmMode(transport)
+        XCTAssertEqual(transport.writes.count, count)
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+    }
+
+    func testSlowModeWriteCannotOutliveFreshBaseline() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.completesImmediately = false
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        let failed = await waitUntil { controller.phase == .failed }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(transport.disconnectCount, 1)
+        let count = transport.writes.count
+        transport.completeNext()
+        XCTAssertEqual(transport.writes.count, count)
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+    }
+
+    func testExpiredBaselineCannotMoveEvenBeforeTimeoutTaskRuns() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        stallActorForDeadlineTest(seconds: 2.05)
+        confirmMode(transport)
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+        XCTAssertFalse(controller.motionEnabled)
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertTrue(controller.errorMessage?.contains("baseline expired") == true)
+    }
+
+    func testDisconnectDuringModeReadCancelsItsDeadlineAndIgnoresLateReply() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        controller.disconnect()
+        let count = transport.writes.count
+        confirmMode(transport) // Even the disconnect grace period cannot advance the jog.
+        XCTAssertEqual(transport.writes.count, count)
+        try await Task.sleep(for: .milliseconds(2200))
+        XCTAssertEqual(controller.phase, .idle)
+        XCTAssertEqual(transport.disconnectCount, 1)
+        XCTAssertNil(controller.errorMessage)
+        XCTAssertTrue(controller.availableJointSlots.isEmpty)
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+    }
+
+    func testJogReadsFreshPoseThenVerifiesModeBeforeFrozenTarget() async throws {
         let transport = FakeTransport()
         let controller = ready(transport)
         defer { transport.emit(.disconnected(nil)) }
         enable(controller, transport: transport)
         transport.writes.removeAll()
-        transport.completesImmediately = false
-        controller.jog(slot: 1, delta: 3)
-        XCTAssertEqual(transport.writes, [try MeccanoidPacket.servoMode(2)])
         transport.emit(.received(poseReply([90, 91, 92, 93, 94, 95, 96, 97])))
-        XCTAssertFalse(transport.writes.contains { $0.first == 8 }, "A reply from an older request must not trigger movement")
-        transport.completeNext() // The mode write is now accepted.
-        XCTAssertEqual(transport.writes.last, MeccanoidPacket.readPose())
+        controller.jog(slot: 1, delta: 3)
+        XCTAssertEqual(transport.writes, [MeccanoidPacket.readPose()])
+        transport.completesImmediately = false
         let fresh: [UInt8] = [100, 110, 120, 130, 140, 150, 160, 170]
         transport.emit(.received(poseReply(fresh)))
+        XCTAssertEqual(transport.writes, [MeccanoidPacket.readPose(), try MeccanoidPacket.servoMode(2)])
+        confirmMode(transport) // An unsolicited mode reply cannot satisfy a later read.
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+        transport.completeNext() // The mode write is now accepted.
+        XCTAssertEqual(transport.writes.last, MeccanoidPacket.readServoModes())
+        transport.emit(.received(poseReply([90, 91, 92, 93, 94, 95, 96, 97])))
+        XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+        confirmMode(transport)
         XCTAssertEqual(transport.writes.last, try MeccanoidPacket.pose([100, 113, 120, 130, 140, 150, 160, 170]))
+        XCTAssertEqual(transport.writes.map { $0.first! }, [9, 0x0B, 0x0A, 8])
     }
 
     func testJogDoesNotOverlapAnOutstandingPoseRead() async {
@@ -531,6 +739,7 @@ final class RobotControllerTests: XCTestCase {
         controller.jog(slot: 2, delta: 3)
         let baseline: [UInt8] = [90, 100, 110, 120, 130, 140, 150, 160]
         transport.emit(.received(poseReply(baseline)))
+        confirmMode(transport)
         let countBeforeManualRead = transport.writes.count
         controller.refreshPose()
         XCTAssertEqual(transport.writes.count, countBeforeManualRead)
@@ -552,14 +761,36 @@ final class RobotControllerTests: XCTestCase {
         XCTAssertTrue(controller.logs.contains { $0.contains("110 → 113") })
     }
 
+    func testUnchangedJointFeedbackDoesNotClaimMovement() async {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        transport.writes.removeAll()
+        controller.jog(slot: 0, delta: 3)
+        let baseline: [UInt8] = [100, 110, 120, 130, 140, 150, 160, 170]
+        transport.emit(.received(poseReply(baseline)))
+        confirmMode(transport)
+        let finalReadRequested = await waitUntil {
+            transport.writes.filter { $0.first == 9 }.count == 2
+        }
+        XCTAssertTrue(finalReadRequested)
+        transport.emit(.received(poseReply(baseline)))
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertEqual(controller.positions, baseline)
+        XCTAssertTrue(controller.statusMessage.contains("No movement is confirmed"))
+        XCTAssertTrue(controller.logs.contains { $0.contains("feedback unchanged at 100 after target 103") })
+    }
+
     func testJogRefreshBackpressureAndLateCompletionCannotExtendDeadline() async throws {
         let transport = FakeTransport()
         let controller = ready(transport)
         defer { transport.emit(.disconnected(nil)) }
         enable(controller, transport: transport)
         controller.jog(slot: 0, delta: 1)
-        transport.completesImmediately = false
         transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        transport.completesImmediately = false
+        confirmMode(transport)
         try await Task.sleep(for: .milliseconds(250))
         XCTAssertEqual(transport.writes.filter { $0.first == 8 }.count, 1, "Never queue behind an outstanding pose")
         let firstAcceptedAt = ContinuousClock.now
@@ -586,8 +817,9 @@ final class RobotControllerTests: XCTestCase {
         let controller = ready(transport)
         enable(controller, transport: transport)
         controller.jog(slot: 0, delta: 1)
-        transport.queuesWrites = true
         transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        transport.queuesWrites = true
+        confirmMode(transport)
         XCTAssertEqual(transport.queued.count, 1)
         stallActorForDeadlineTest()
         transport.drainQueuedWrites() // Readiness occurs before the controller's Task can execute.
@@ -598,13 +830,40 @@ final class RobotControllerTests: XCTestCase {
         XCTAssertEqual(transport.disconnectCount, 1)
     }
 
+    func testQueuedFirstPoseCannotOutliveBaselineAfterSlowModeConfirmation() async throws {
+        let transport = FakeTransport()
+        let controller = ready(transport)
+        defer { transport.emit(.disconnected(nil)) }
+        enable(controller, transport: transport)
+        controller.jog(slot: 0, delta: 1)
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        let baselineDeadline = try XCTUnwrap(transport.transmitted.first { $0.data.first == 0x0B }?.notAfter)
+        try await ContinuousClock().sleep(until: baselineDeadline.advanced(by: .milliseconds(-600)))
+        transport.queuesWrites = true
+        confirmMode(transport)
+        let firstPose = try XCTUnwrap(transport.queued.first { $0.data.first == 8 })
+        XCTAssertEqual(firstPose.notAfter, baselineDeadline, "Mode confirmation must not extend the frozen baseline's lifetime")
+        // Block the expiry task, then make the transport ready after the original
+        // baseline expires but before a newly started one-second window would.
+        stallActorForDeadlineTest(seconds: 0.7)
+        transport.drainQueuedWrites()
+        XCTAssertFalse(transport.transmitted.contains { $0.data.first == 8 })
+        XCTAssertTrue(transport.queued.isEmpty)
+        XCTAssertEqual(controller.phase, .failed)
+        XCTAssertFalse(controller.motionEnabled)
+        XCTAssertFalse(controller.motionBusy)
+        XCTAssertEqual(transport.disconnectCount, 1)
+        XCTAssertTrue(controller.errorMessage?.contains("expired") == true)
+    }
+
     func testIndependentDeadlineCancelsPoseThatNeverBecomesReady() async {
         let transport = FakeTransport()
         let controller = ready(transport)
         enable(controller, transport: transport)
         controller.jog(slot: 0, delta: 1)
-        transport.queuesWrites = true
         transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        transport.queuesWrites = true
+        confirmMode(transport)
         XCTAssertEqual(transport.queued.count, 1)
         let failed = await waitUntil(timeout: .seconds(2)) { controller.phase == .failed }
         XCTAssertTrue(failed)
@@ -622,6 +881,7 @@ final class RobotControllerTests: XCTestCase {
         enable(controller, transport: transport)
         controller.jog(slot: 0, delta: 1)
         transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        confirmMode(transport)
         try await Task.sleep(for: .milliseconds(230))
         controller.stop()
         let poses = transport.writes.filter { $0.first == 8 }.count
@@ -673,8 +933,9 @@ final class RobotControllerTests: XCTestCase {
         defer { transport.emit(.disconnected(nil)) }
         enable(controller, transport: transport)
         controller.jog(slot: 0, delta: 1)
-        transport.completesImmediately = false
         transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        transport.completesImmediately = false
+        confirmMode(transport)
         transport.emit(.disconnected(nil))
         transport.completesImmediately = true
         controller.startScan()
@@ -698,6 +959,7 @@ final class RobotControllerTests: XCTestCase {
         enable(controller, transport: transport)
         controller.jog(slot: 0, delta: 1)
         transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        confirmMode(transport)
         let failed = await waitUntil(timeout: .seconds(4)) { controller.phase == .failed }
         XCTAssertTrue(failed)
         XCTAssertFalse(controller.motionBusy)
@@ -715,7 +977,7 @@ final class RobotControllerTests: XCTestCase {
             transport.writes.removeAll()
             controller.jog(slot: 0, delta: delta)
             transport.emit(.received(poseReply([UInt8(position), 110, 120, 130, 140, 150, 160, 170])))
-            XCTAssertFalse(transport.writes.contains { $0.first == 8 })
+            XCTAssertFalse(transport.writes.contains { $0.first == 8 || $0.first == 0x0B })
             XCTAssertFalse(controller.motionBusy)
         }
     }
@@ -738,8 +1000,9 @@ final class RobotControllerTests: XCTestCase {
         let controller = ready(transport)
         defer { transport.emit(.disconnected(nil)) }
         enable(controller, transport: transport)
-        transport.completesImmediately = false
         controller.jog(slot: 0, delta: 1)
+        transport.completesImmediately = false
+        transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
         let cancelsBefore = transport.cancellationCount
         controller.stop()
         let countAfterStop = transport.writes.count
@@ -933,6 +1196,7 @@ final class RobotControllerTests: XCTestCase {
         enable(controller, transport: transport)
         controller.jog(slot: 0, delta: 1)
         transport.emit(.received(poseReply([100, 110, 120, 130, 140, 150, 160, 170])))
+        confirmMode(transport)
         controller.appBecameInactive()
         XCTAssertFalse(controller.motionEnabled)
         XCTAssertTrue(transport.writes.suffix(2).contains(MeccanoidPacket.zeroWheels()))

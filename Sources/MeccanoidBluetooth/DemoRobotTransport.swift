@@ -25,6 +25,12 @@ final class DemoRobotTransport: RobotTransport {
             completion(.failure(LinkError(message: "Command expired before practice transport could send it.")))
             return
         }
+        // Apply simulated writes before their completion can trigger a read.
+        // Real mode replies are still separate notifications, as below.
+        if data.first == 0x0B {
+            modes = Array(data.dropFirst().prefix(8)) + Array(repeating: 0, count: 8)
+        }
+        if data.first == 0x08 { pose = Array(data.dropFirst().prefix(8)) }
         completion(.success(()))
         switch data.first {
         case 0x1a: onEvent?(.received(MeccanoidPacket.pin()))
@@ -33,9 +39,12 @@ final class DemoRobotTransport: RobotTransport {
         case 0x03: onEvent?(.received(frame(3, payload: Array(repeating: 0, count: 16))))
         case 0x20: onEvent?(.received(frame(0x20, payload: [0x22, 0x21, 0x20, 0, 1, 2, 0x10, 0x11] + Array(repeating: 255, count: 8))))
         case 0x0A: onEvent?(.received(frame(0x0A, payload: modes)))
-        case 0x0B: modes = Array(data.dropFirst().prefix(8)) + Array(repeating: 0, count: 8)
-        case 0x09: onEvent?(.received(frame(9, payload: pose)))
-        case 0x08: pose = Array(data.dropFirst().prefix(8))
+        case 0x09:
+            // Observed on the pilot MeccaBrain: a position read changes the
+            // mapped servos back to read mode. Keep this regression in practice
+            // mode so a mode-before-read sequence cannot appear to work here.
+            modes = Array(repeating: 4, count: 8) + Array(repeating: 0, count: 8)
+            onEvent?(.received(frame(9, payload: pose)))
         default: break
         }
     }

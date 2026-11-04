@@ -2,7 +2,11 @@
 
 A native SwiftUI controller for Meccanoid robots on **iPhone, iPad and Mac**. It connects directly to the original MeccaBrain over Bluetooth Low Energy. No replacement controller, firmware flashing, browser, account or cloud service is required by this app.
 
-**Experimental alpha. Bluetooth connection and blue eyes are physically confirmed through the native Mac app on one model 91763 MeccaBrain.** The operator confirmed the blue-eye change on 4 November 2026. Neither a single joint-pose write nor the bounded ten-frame refresh produced confirmed movement: the operator observed only a light flash, and position feedback stayed unchanged. The operator reports normal arm movement through the robot's onboard controls and voice commands. A read-only diagnostic found a logical mapping discrepancy, but it has not been established as the cause of the tested slot's failure. Wheels and physical iPhone/iPad control remain untested. See the [hardware evidence](docs/hardware-pilot.md).
+**Experimental alpha. The operator confirms that driving commands and lights work through the native Mac app on one model 91763 MeccaBrain. Joint movement with the corrected command order is not yet physically confirmed.** Wheel direction, physical pulse duration and stopping have not been independently verified. Physical iPhone/iPad control remains untested.
+
+The app's connection and blue-eye change were confirmed on 4 November 2026. Earlier single-write and bounded-refresh tests produced no confirmed joint movement: the operator observed only a light flash, and position feedback stayed unchanged. The operator reports normal arm movement through the robot's onboard controls and voice commands. Native diagnostics later showed control mode 2 changing to mode 4 after a position read. The app now reads the pose first, then sets and verifies mode 2 before sending the target, with the same ±3-unit limit.
+
+Practice feedback changed from 128 to 131. In the corrected physical trial, joint 3 reported mode 2 before a nine-frame refresh from 33 toward 36, but feedback remained 33; the operator's visual report is pending. Joint movement and the separate mapping discrepancy remain unresolved. See the [hardware evidence](docs/hardware-pilot.md).
 
 Builds, automated checks and practice mode cannot establish joint travel, wheel direction or reliable stopping. Compatibility with each robot generation and firmware remains unverified.
 
@@ -13,14 +17,15 @@ The initial target is the stock G15/G15KS-era MeccaBrain interface, including th
 - Explicit Bluetooth scanning, robot selection, service discovery and PIN handshake.
 - Eye-colour commands with operator confirmation before movement can be enabled.
 - Read-only robot layout showing detected modules, logical joint slots and reported modes while movement is disabled.
-- Eight raw servo slots, with fresh position reads before small joint nudges.
+- **Find connected joints** before nudging; the picker offers only configured servo entries among the first eight logical slots, without assuming body-part names.
+- Fresh pose sampling followed by verified control mode before each small joint nudge.
 - Short wheel-pulse controls and a prominent Stop action.
 - Connection timeouts, status polling and reset of movement permission on disconnect.
 - Practice mode with a simulated robot and no Bluetooth access.
 
 The app uses only Apple frameworks and the local Swift package in this repository. There are no external Swift package dependencies, analytics, network requests or downloaded runtime assets. Bluetooth permission is requested when you choose to scan. Diagnostics stay in memory for the current app session.
 
-The **Read robot layout** feature builds for Mac and iPhone/iPad and has been checked through the native Mac practice interface. Its native app interface has not yet been tested against the physical robot; the mapping evidence above came from a separate read-only command-line diagnostic. It does not repair mappings or establish which body part a slot moves.
+The layout-reading feature builds for Mac and iPhone/iPad and has been checked in the native Mac practice interface and against the physical robot. **Find connected joints** uses that reading to populate the joint picker; run it while movement is disabled. **Read robot layout** under Connection details shows the same inventory. Neither action repairs mappings or establishes which body part a slot moves.
 
 ## Build and run
 
@@ -55,11 +60,13 @@ Follow the [hardware pilot](docs/hardware-pilot.md) when an operator and robot a
 
 Send one eye colour and observe the robot. A successful Bluetooth write means the command was submitted, not that the eyes changed. Confirm the change only after seeing it. Movement still requires a separate explicit enable action.
 
+Before a joint nudge, leave movement disabled and choose **Find connected joints**. Wait for the reading, select an offered slot, then enable movement for one small nudge.
+
 The initial movement limits are intentionally small:
 
 | Control | App behaviour | What remains unknown |
 | --- | --- | --- |
-| Joint nudge | At most ±3 raw units after a fresh complete pose; refreshes the same target for up to one second, preserving the other seven values | Physical movement, joint identity, degrees, direction and mechanical limits |
+| Joint nudge | At most ±3 raw units after a fresh complete pose and mode-2 confirmation; up to one second of identical target refreshes, all within the frozen baseline's two-second expiry | Physical movement, joint identity, degrees, direction and mechanical limits |
 | Wheels | At most ±40 raw PWM units; schedules zero-speed after 250 ms | Actual speed, direction and physical pulse duration |
 | Stop | Cancels queued motion and sends zero-wheel plus a firmware-specific stop request | Whether every actuator stops on each firmware |
 
